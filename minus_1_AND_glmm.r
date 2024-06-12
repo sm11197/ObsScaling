@@ -1,6 +1,6 @@
 # args <- c() # nolint: commented_code_linter, commented_code_linter.
 # args[1] <- "~/git/predicting-capabilities/ObsScaling/" # nolint: commented_code_linter, line_length_linter.
-main <- function() {
+main <- function() { # nolint: cyclocomp_linter.
   args <- commandArgs(trailingOnly = TRUE)
   #### Libraries, if not yet installed use install.packages
   library(lme4)
@@ -101,7 +101,7 @@ main <- function() {
     minus_1_flops <- target_model$FLOPs..1E21.[1]
     minus_1_score <- target_model[[benchmark_column]][1]
     # Final normalized score calculation
-    return(minus_1_score * log(current_flops) / log(minus_1_flops))
+    return(minus_1_score) * (log(current_flops) / log(minus_1_flops))
   }
   ## Single column use. Apply the function to create 'GSM8K_minus_1'
   # base_llm$GSM8K_minus_1 <- sapply(1:nrow(base_llm), function(idx) {
@@ -130,40 +130,31 @@ main <- function() {
 
   ## Relationship Check
   ## just eyeballing making it more linear for now
-  # plot(base_llm_clean$arithmetic_3ds_2_acc, log10(base_llm_clean$GSM8K + 0.01)) # nolint
-  # plot(base_llm_clean$arithmetic_3ds_2_acc, log10(base_llm_clean$FLOPs..1E21.)) # nolint
-  # plot(base_llm_clean$XWinograd, log10(base_llm_clean$XWinograd_minus_1 + 0.01)) # nolint
+  # plot(log10(base_llm$FLOPs..1E21.), base_llm$GSM8K) # nolint
+  # plot(base_llm$GSM8K_minus_1, base_llm$GSM8K) # nolint
 
   ### MODELING
   ## Example of how to fit a single mixed effects model
-
-  # mixed_model <- lmer(
-  #   arithmetic_3ds_2_acc ~ log(FLOPs..1E21.) +
-  #     (1 | Model.Family) + log(GSM8K_minus_1 + 0.01), # nolint: commented_code_linter, line_length_linter.
-  #   data = base_llm_clean, REML = FALSE
-  # )
   # Done: binomial GLMM
   # TODO: replace with number of questions in benchmark?
-  base_llm_clean$successes <- round(base_llm_clean$XWinograd * 100)
-  base_llm_clean$failures <- 100 - base_llm_clean$successes
-  # mixed_model <- glmer(
-  #   cbind(successes, failures) ~ log(FLOPs..1E21.) +
-  #     (1 | Model.Family) + log(XWinograd_minus_1), # nolint: commented_code_linter, line_length_linter.
-  #   data = base_llm_clean, # nolint: commented_code_linter.
-  #   family = binomial(link = "logit"), # nolint: commented_code_linter.
-  #   control = glmerControl(optimizer = "bobyqa") # nolint: commented_code_linter, line_length_linter.
-  # )
+  base_llm$XWinograd_successes <- round(base_llm$XWinograd * 100)
+  base_llm$XWinograd_failures <- 100 - base_llm$XWinograd_successes
   # Done: random slopes as well as intercepts
   mixed_model <- glmer(
-    cbind(successes, failures) ~ log(FLOPs..1E21.) +
-      (1 | Model.Family) + log(XWinograd_minus_1 + 0.01),
-    data = base_llm_clean,
+    cbind(XWinograd_successes, XWinograd_failures) ~ log10(FLOPs..1E21.) +
+      (1 | Model.Family) + XWinograd_minus_1,
+    data = base_llm[complete.cases(base_llm[c(
+      "XWinograd_successes",
+      "XWinograd_failures",
+      "FLOPs..1E21.", "Model.Family",
+      "XWinograd_minus_1"
+    )]), ],
     family = binomial(link = "logit"),
     control = glmerControl(optimizer = "bobyqa")
   )
   # Check Random Effects
-  print(ranef(mixed_model)) # Check the random effects output
   summary(mixed_model)
+  print(ranef(mixed_model)) # Check the random effects output
   # Plotting to assess possible issues
   fitted.values <- fitted(mixed_model)
   residuals <- resid(mixed_model, type = "pearson")
@@ -171,22 +162,28 @@ main <- function() {
   plot(fitted.values, residuals)
   abline(h = 0, col = "red")
   # Post-fit prediction check (you'll need actual observed data here)
-  observed <- with(base_llm_clean, cbind(successes, failures))
+  observed <- with(base_llm[complete.cases(base_llm[c(
+    "XWinograd_successes",
+    "XWinograd_failures",
+    "FLOPs..1E21.", "Model.Family",
+    "XWinograd_minus_1"
+  )]), ], cbind(XWinograd_successes, XWinograd_failures))
   predicted <- predict(mixed_model, type = "response", re.form = NA)
   # Plot observed vs. predicted (logistic predictions)
   observed_prop <- observed[, 1] / rowSums(observed)
   plot(observed_prop, predicted,
     xlab = "Observed XWinograd", ylab = "Predicted XWinograd",
-    main = "XWinograd", sub = "XWinograd ~ log(FLOPs..1E21.) +
-    (1 | Model.Family) + log(XWinograd_minus_1)",
-    cex.sub = 0.75, xlim = c(0.4, 0.9), ylim = c(0.4, 0.9)
+    main = "XWinograd", sub = "Predicted XWinograd ~ log(FLOPs..1E21.) + (1 | Model.Family) + XWinograd_minus_1", # nolint
+    cex.sub = 0.65, # xlim = c(0.4, 0.9), ylim = c(0.4, 0.9)
   )
   abline(a = 0, b = 1, col = "red") # Ideal line where observed equals predicted
 
-  # TODO: grid search of all possible predictive models
+  # TODO: grid search of all possible predictive benchmarks. Done: 06/12 flops, n-1 # nolint
+  # Define the cutoff for FLOPs to split the data
+  cutoff_flops <- 8.4 * 10
   # Calculating AIC and guarding against errors
   calculate_model_aic <- function(model) {
-    if (class(model) != "try-error") {
+    if (!is.na(model) && class(model) != "try-error") {
       aic_value <- AIC(model)
       return(aic_value)
     } else {
@@ -198,7 +195,6 @@ main <- function() {
   fit_model <- function(formula, data) {
     model <- tryCatch(
       {
-        # Proper glmer call within a tryCatch
         glmer(formula,
           data = data,
           family = binomial(link = "logit"),
@@ -217,7 +213,6 @@ main <- function() {
         message("Attempted model: ", deparse(formula))
       }
     )
-
     return(model)
   }
 
@@ -225,14 +220,14 @@ main <- function() {
   best_models <- list()
 
   # Number of trials (assuming it's a constant across benchmarks)
-  number_of_trials <- 100 # Replace as needed if you have actual data
+  number_of_trials <- 100 # Replace as needed
 
   for (benchmark in benchmark_columns) {
     # Dynamically create successes and failures columns
-    base_llm_clean[[paste(benchmark, "successes", sep = "_")]] <-
-      round(base_llm_clean[[benchmark]] * number_of_trials)
-    base_llm_clean[[paste(benchmark, "failures", sep = "_")]] <-
-      number_of_trials - base_llm_clean[[paste(benchmark,
+    base_llm[[paste(benchmark, "successes", sep = "_")]] <-
+      round(base_llm[[benchmark]] * number_of_trials)
+    base_llm[[paste(benchmark, "failures", sep = "_")]] <-
+      number_of_trials - base_llm[[paste(benchmark,
         "successes",
         sep = "_"
       )]]
@@ -250,26 +245,29 @@ main <- function() {
       response_failures, ")",
       sep = ""
     )
+    benchmark_minus_1 <- paste0(benchmark, "_minus_1")
+
+    # Remove NAs
+    base_llm_clean <- base_llm[complete.cases(base_llm[c(
+      response_formula,
+      response_failures,
+      "FLOPs..1E21.", "Model.Family",
+      benchmark_minus_1
+    )]), ]
+    # Split
+    train_data <- base_llm_clean %>% filter(FLOPs..1E21. <= cutoff_flops)
+    test_data <- base_llm_clean %>% filter(FLOPs..1E21. > cutoff_flops)
 
     # Model 1: Base model
-    formula_base <- as.formula(paste(response, "~ (1|Model.Family) +
-    log(", benchmark, " + 0.01)"))
-    model_base <- fit_model(formula_base, base_llm_clean)
-    aic_scores[nrow(aic_scores) + 1, ] <- c(
-      "Base",
-      calculate_model_aic(model_base)
-    )
+    formula_base <- as.formula(paste(response, "~ log(FLOPs..1E21.) + (1|Model.Family)"))
+    model_base <- fit_model(formula_base, train_data)
+    aic_scores[nrow(aic_scores) + 1, ] <- c("Flops Only", calculate_model_aic(model_base))
 
-    # Model 2: Including FLOPs # TODO, flops only
-    formula_flops <- as.formula(paste(
-      response,
-      "~ log(FLOPs..1E21.) + (1|Model.Family) + log(", benchmark, " + 0.01)"
-    ))
-    model_flops <- fit_model(formula_flops, base_llm_clean)
-    aic_scores[nrow(aic_scores) + 1, ] <- c(
-      "FLOPs",
-      calculate_model_aic(model_flops)
-    )
+    # Model 2: Including n-1
+    formula_minus_1 <- as.formula(paste0(response, " ~ log(FLOPs..1E21.) + (1|Model.Family) + ", benchmark_minus_1))
+    model_minus_1 <- fit_model(formula_minus_1, train_data)
+    aic_scores[nrow(aic_scores) + 1, ] <- c("Flops + n-1", calculate_model_aic(model_minus_1))
+
 
     # Determine the best model for this benchmark
     if (any(!is.na(aic_scores$aic))) {
@@ -282,120 +280,7 @@ main <- function() {
     }
   }
 
-  # Let's choose one benchmark to work with, say 'benchmark_i'
-  benchmark_i <- "MMLU" # the target benchmark
-
-  # Dynamically create scores and failures for this benchmark
-  number_of_trials <- 100 # Assuming 100 trials; replace or modify as needed
-  base_llm_clean[[paste(benchmark_i, "successes", sep = "_")]] <-
-    round(base_llm_clean[[benchmark_i]] * number_of_trials)
-  base_llm_clean[[paste(benchmark_i, "failures", sep = "_")]] <-
-    number_of_trials - base_llm_clean[[paste(benchmark_i,
-      "successes",
-      sep = "_"
-    )]]
-
-  # List of possible predictors: other benchmarks' minus_1 scores
-  predictor_benchmarks <- grep("minus_1", names(base_llm_clean), value = TRUE)
-  predictor_benchmarks <- setdiff(
-    predictor_benchmarks,
-    paste(benchmark_i, "minus_1", sep = "_")
-  ) # Exclude its own minus_1
-
-  # Initialize stores for results
-  best_models <- list()
-  aic_scores <- vector("numeric", length(predictor_benchmarks))
-
-  # Define response for model
-  response <- paste("cbind(", paste(benchmark_i, "successes", sep = "_"),
-    ",", paste(benchmark_i, "failures", sep = "_"), ")",
-    sep = ""
-  )
-
-  # Grid Search: Try each minus 1 score as a predictor
-  for (k in seq_along(predictor_benchmarks)) {
-    formula <- as.formula(paste(
-      response, "~",
-      paste("log(", predictor_benchmarks[k], "+0.01) + (1|Model.Family)")
-    ))
-    model <- tryCatch(
-      {
-        glmer(formula, data = base_llm_clean, family = binomial(link = "logit"))
-      },
-      error = function(e) {
-        message(
-          "Error with model using predictor ",
-          predictor_benchmarks[k], ": ", e$message
-        )
-        return(NA)
-      }
-    )
-
-    # Store model if successful
-    if (!is.na(model)) {
-      aic_scores[k] <- AIC(model)
-      best_models[[predictor_benchmarks[k]]] <- list(
-        formula = formula,
-        aic = AIC(model),
-        model = model
-      )
-    }
-  }
-
-  # Determine best model from models that completed successfully
-  if (length(best_models) > 0) {
-    best_fit_index <- which.min(aic_scores)
-    best_fit_model <- best_models[[best_fit_index]]
-    print(best_fit_model)
-  } else {
-    message("No successful model fits were found.")
-  }
-
-  # Print out the best models for each benchmark
-  print(best_models)
-
-  # Extract the AICs and find the minimum
-  min_aic <- min(sapply(best_models, function(x) x$aic))
-  best_model_name <- names(which.min(sapply(best_models, function(x) x$aic)))
-
-  # Output the best model details
-  cat("Best Model is based on predictor:", best_model_name, "\n")
-  cat("It has the lowest AIC of:", min_aic, "\n")
-  print(best_models[[best_model_name]])
-
-  plot(base_llm_clean$ipa_transliterate_2_bleu, base_llm_clean$MMLU)
-
-  # TODO: train/test split
-
-
-
-  # Create the scatter plot with facets for each Model.Family
-  ggplot(
-    base_llm,
-    aes(x = FLOPs..1E21., y = MMLU) # nolint: object_usage_linter.
-  ) +
-    geom_point() + # Add points
-    facet_wrap(~Model.Family, scales = "free") + # Add facets
-    labs(
-      x = "FLOPs (1E21)", y = "MMLU Scores",
-      title = "Relationship between FLOPs and MMLU by Model.Family"
-    ) +
-    theme_minimal()
-
-  # Create the scatter plot coloring points by Model.Family
-  ggplot(
-    base_llm,
-    aes(
-      x = FLOPs..1E21., y = MMLU, # nolint: object_usage_linter.
-      color = Model.Family # nolint: object_usage_linter.
-    )
-  ) +
-    geom_point() + # Adds colored points based on Model.Family
-    labs(
-      x = "FLOPs (1E21)", y = "MMLU Scores",
-      title = "Relationship between FLOPs and MMLU by Model.Family"
-    ) +
-    theme_minimal() # Applies a minimal theme
+  # TODO: train/test split (halfway)
 }
 
 main()
