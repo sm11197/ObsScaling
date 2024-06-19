@@ -2,10 +2,12 @@
 # args[1] <- "~/git/predicting-capabilities/ObsScaling/" # nolint: commented_code_linter, line_length_linter.
 main <- function() { # nolint: cyclocomp_linter.
   args <- commandArgs(trailingOnly = TRUE)
-  #### Libraries, if not yet installed use install.packages
+  #### Libraries, if not yet installed use install.packages("package_name")
   library(lme4)
   library(dplyr)
   library(ggplot2)
+  library(pROC)
+  library(caret)
 
   #### DATA PREP/EXPLROATION
   ## Read in the data
@@ -116,76 +118,54 @@ main <- function() { # nolint: cyclocomp_linter.
   )
   # Identify benchmark columns by exclusion
   benchmark_columns <- setdiff(names(base_llm), non_benchmark_columns)
+  # Number of trials (assuming it's a constant across benchmarks)
   # Apply the 'get_minus_1_normalized' function across all benchmarks
-  for (benchmark_column in benchmark_columns) {
-    new_column_name <- paste(benchmark_column, "minus_1", sep = "_")
+  number_of_trials <- 100 # Replace as needed
+  for (benchmark in benchmark_columns) {
+    new_column_name <- paste(benchmark, "minus_1", sep = "_")
     base_llm[[new_column_name]] <- sapply(
       seq_len(nrow(base_llm)),
       function(idx) {
-        get_minus_1_normalized(idx, base_llm, benchmark_column)
+        get_minus_1_normalized(idx, base_llm, benchmark)
       }
     )
+    # Dynamically create successes and failures columns as well
+    base_llm[[paste(benchmark, "successes", sep = "_")]] <-
+      round(base_llm[[benchmark]] * number_of_trials)
+    base_llm[[paste(benchmark, "failures", sep = "_")]] <-
+      number_of_trials - base_llm[[paste(benchmark, "successes", sep = "_")]]
   }
-  # base_llm : 107 rows, 39 cols 06/12
-
-  ## Relationship Check
-  ## just eyeballing making it more linear for now
-  # plot(log10(base_llm$FLOPs..1E21.), base_llm$GSM8K) # nolint
-  # plot(base_llm$GSM8K_minus_1, base_llm$GSM8K) # nolint
+  # base_llm : 107 rows, 71 cols 06/19
 
   ### MODELING
-  ## Example of how to fit a single mixed effects model
-  # Done: binomial GLMM
-  # TODO: replace with number of questions in benchmark?
-  base_llm$XWinograd_successes <- round(base_llm$XWinograd * 100)
-  base_llm$XWinograd_failures <- 100 - base_llm$XWinograd_successes
-  # Done: random slopes as well as intercepts
-  mixed_model <- glmer(
-    cbind(XWinograd_successes, XWinograd_failures) ~ log10(FLOPs..1E21.) +
-      (1 | Model.Family) + XWinograd_minus_1,
-    data = base_llm[complete.cases(base_llm[c(
-      "XWinograd_successes",
-      "XWinograd_failures",
-      "FLOPs..1E21.", "Model.Family",
-      "XWinograd_minus_1"
-    )]), ],
-    family = binomial(link = "logit"),
-    control = glmerControl(optimizer = "bobyqa")
-  )
-  # Check Random Effects
-  summary(mixed_model)
-  print(ranef(mixed_model)) # Check the random effects output
-  # Plotting to assess possible issues
-  fitted.values <- fitted(mixed_model)
-  residuals <- resid(mixed_model, type = "pearson")
-  # Basic residual plot
-  plot(fitted.values, residuals)
-  abline(h = 0, col = "red")
-  # Post-fit prediction check (you'll need actual observed data here)
-  observed <- with(base_llm[complete.cases(base_llm[c(
-    "XWinograd_successes",
-    "XWinograd_failures",
-    "FLOPs..1E21.", "Model.Family",
-    "XWinograd_minus_1"
-  )]), ], cbind(XWinograd_successes, XWinograd_failures))
-  predicted <- predict(mixed_model, type = "response", re.form = NA)
-  # Plot observed vs. predicted (logistic predictions)
-  observed_prop <- observed[, 1] / rowSums(observed)
-  plot(observed_prop, predicted,
-    xlab = "Observed XWinograd", ylab = "Predicted XWinograd",
-    main = "XWinograd", sub = "Predicted XWinograd ~ log(FLOPs..1E21.) + (1 | Model.Family) + XWinograd_minus_1", # nolint
-    cex.sub = 0.65, # xlim = c(0.4, 0.9), ylim = c(0.4, 0.9)
-  )
-  abline(a = 0, b = 1, col = "red") # Ideal line where observed equals predicted
+  ## REMOVED: Example of how to fit a single mixed effects model
 
   # TODO: grid search of all possible predictive benchmarks. Done: 06/12 flops, n-1 # nolint
   # Define the cutoff for FLOPs to split the data
   cutoff_flops <- 8.4 * 10
-  # Calculating AIC and guarding against errors
-  calculate_model_aic <- function(model) {
+  # Calculating AIC/other metrics and guarding against errors
+  calculate_model_metrics <- function(model) {
     if (!is.na(model) && class(model) != "try-error") {
+      # best model fit
       aic_value <- AIC(model)
-      return(aic_value)
+      # Predictions on test data
+      test_predictions <- predict(model,
+        newdata = test_data, re.form = NA, type = "response"
+      )
+      accuracy <- sum(round(test_data[[response_formula]]/100, 1) == round(test_predictions, 1)) / length(test_predictions)
+      # # Convert probabilities to binary outcomes using a threshold (e.g., 0.5)
+      # pred_binary <- ifelse(test_predictions > 0.5, 1, 0)
+      # test_binary <- ifelse(test_data[[response_formula]]/100 > 0.5, 1, 0)
+      # # Evaluate performance
+      # confusion <- confusionMatrix(
+      #   factor(round(test_predictions,2)),
+      #   factor(test_data[[response_formula]]/100)
+      # )
+      # roc_obj <- roc(test_data[[response_formula]], test_predictions)
+      # auc_metric <- auc(roc_obj)
+      rmse <- sqrt(mean((round(test_data[[response_formula]] / 100, 2) - round(test_predictions / 100, 2))^2))
+      r_squared <- cor(round(test_data[[response_formula]] / 100, 2), round(test_predictions / 100, 2))^2
+      return(c(aic_value, accuracy, rmse)) # confusion$overall["Accuracy"]
     } else {
       return(NA)
     }
@@ -219,25 +199,17 @@ main <- function() { # nolint: cyclocomp_linter.
   # Container for results
   best_models <- list()
 
-  # Number of trials (assuming it's a constant across benchmarks)
-  number_of_trials <- 100 # Replace as needed
-
   for (benchmark in benchmark_columns) {
-    # Dynamically create successes and failures columns
-    base_llm[[paste(benchmark, "successes", sep = "_")]] <-
-      round(base_llm[[benchmark]] * number_of_trials)
-    base_llm[[paste(benchmark, "failures", sep = "_")]] <-
-      number_of_trials - base_llm[[paste(benchmark,
-        "successes",
-        sep = "_"
-      )]]
-
-    aic_scores <- data.frame(
+    performance_metrics <- data.frame(
+      benchmark = character(),
       model_type = character(),
       aic = numeric(),
+      binary_accuracy = numeric(),
+      rmse = numeric(),
+      # auc = numeric(),
       stringsAsFactors = FALSE
     )
-
+    
     # Dynamic responses based on current benchmark
     response_formula <- paste(benchmark, "successes", sep = "_")
     response_failures <- paste(benchmark, "failures", sep = "_")
@@ -255,24 +227,45 @@ main <- function() { # nolint: cyclocomp_linter.
       benchmark_minus_1
     )]), ]
     # Split
-    train_data <- base_llm_clean %>% filter(FLOPs..1E21. <= cutoff_flops)
-    test_data <- base_llm_clean %>% filter(FLOPs..1E21. > cutoff_flops)
+    train_data <- base_llm_clean %>% filter(FLOPs..1E21. <= cutoff_flops) # nolint
+    test_data <- base_llm_clean %>% filter(FLOPs..1E21. > cutoff_flops) # nolint
 
     # Model 1: Base model
-    formula_base <- as.formula(paste(response, "~ log(FLOPs..1E21.) + (1|Model.Family)"))
+    formula_base <- as.formula(paste(
+      response,
+      "~ log(FLOPs..1E21.) + (1|Model.Family)"
+    ))
     model_base <- fit_model(formula_base, train_data)
-    aic_scores[nrow(aic_scores) + 1, ] <- c("Flops Only", calculate_model_aic(model_base))
+    performance_metrics[nrow(performance_metrics) + 1, ] <- c(
+      benchmark,
+      "Flops Only",
+      calculate_model_metrics(model_base)[1],
+      calculate_model_metrics(model_base)[2],
+      calculate_model_metrics(model_base)[3]
+    )
 
     # Model 2: Including n-1
-    formula_minus_1 <- as.formula(paste0(response, " ~ log(FLOPs..1E21.) + (1|Model.Family) + ", benchmark_minus_1))
+    formula_minus_1 <- as.formula(paste0(
+      response,
+      " ~ log(FLOPs..1E21.) + (1|Model.Family) + ", benchmark_minus_1
+    ))
     model_minus_1 <- fit_model(formula_minus_1, train_data)
-    aic_scores[nrow(aic_scores) + 1, ] <- c("Flops + n-1", calculate_model_aic(model_minus_1))
+    performance_metrics[nrow(performance_metrics) + 1, ] <- c(
+      benchmark,
+      "Flops + n-1",
+      calculate_model_metrics(model_minus_1)[1],
+      calculate_model_metrics(model_minus_1)[2],
+      calculate_model_metrics(model_minus_1)[3]
+      
+    )
 
 
     # Determine the best model for this benchmark
-    if (any(!is.na(aic_scores$aic))) {
-      best_model <- aic_scores %>%
-        filter(aic == min(aic, na.rm = TRUE)) # nolint: object_usage_linter.
+    if (any(!is.na(performance_metrics$aic))) {
+      best_model <- performance_metrics %>%
+        filter(
+          aic == min(aic, na.rm = TRUE),
+        ) # nolint: object_usage_linter.
       best_models[[benchmark]] <- best_model
     } else {
       best_models[[benchmark]] <- NA
@@ -280,7 +273,13 @@ main <- function() { # nolint: cyclocomp_linter.
     }
   }
 
-  # TODO: train/test split (halfway)
+  print(best_models)
+  #print(performance_metrics)
+
+  # Optionally, plot ROC curve for the last evaluated benchmark
+  plot(roc_obj)
+
+  # Done? train/test split
 }
 
 main()
