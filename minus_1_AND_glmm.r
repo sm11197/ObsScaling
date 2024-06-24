@@ -45,6 +45,23 @@ main <- function() { # nolint: cyclocomp_linter.
   base_llm_emergent_eval$Model <- toupper(
     base_llm_emergent_eval$Model
   )
+  
+  # Consolidate LLAMA and QWEN model families
+  consolidate_model_family <- function(family) {
+    if (grepl("OPENLLAMA", family, ignore.case = TRUE)) {
+      return("OPENLLAMA")
+    } else if (grepl("CODELLAMA", family, ignore.case = TRUE)) {
+      return("CODELLAMA")
+    } else if (grepl("LLAMA", family)) {
+      return("LLAMA")
+    } else if (grepl("QWEN", family)) {
+      return("QWEN")
+    } else {
+      return(family)
+    }
+  }
+  
+  base_llm_benchmark_eval$Model.Family <- sapply(base_llm_benchmark_eval$Model.Family, consolidate_model_family)
   ## Merge datasets by Model, all. Suffix "benchmark" and "emergent"
   base_llm <- merge(
     base_llm_benchmark_eval, base_llm_emergent_eval,
@@ -54,9 +71,28 @@ main <- function() { # nolint: cyclocomp_linter.
   base_llm[sapply(base_llm, is.character)] <- lapply(
     base_llm[sapply(base_llm, is.character)], as.factor
   )
+  # Count the number of models in each family
+  family_counts <- table(base_llm$Model.Family)
+  
+  # Identify families with at least 3 models
+  valid_families <- names(family_counts[family_counts >= 3])
+  
+  # Filter the dataset to keep only the valid families
+  base_llm <- base_llm[base_llm$Model.Family %in% valid_families, ]
+  
+  # Re-factor Model.Family to remove unused levels
+  base_llm$Model.Family <- factor(base_llm$Model.Family)
+  
   ## Summary stats
   print(summary(base_llm))
-
+  
+  # Print the number of models remaining
+  print(paste("Number of models remaining:", nrow(base_llm)))
+  
+  # Print the remaining model families and their counts
+  remaining_family_counts <- table(base_llm$Model.Family)
+  print("Remaining model families and their counts:")
+  print(remaining_family_counts)
   ## If you want to make a plot like I shared to group + emergent benchmarks
   # install.packages("PerformanceAnalytics") # nolint: commented_code_linter.
   # library(PerformanceAnalytics) # nolint: commented_code_linter.
