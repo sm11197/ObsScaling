@@ -1,3 +1,5 @@
+# if (!require(pROC)) install.packages("pROC", dependencies=TRUE)
+# if (!require(caret)) install.packages("caret", dependencies=TRUE)
 # args <- c() # nolint: commented_code_linter, commented_code_linter.
 # args[1] <- "~/git/predicting-capabilities/ObsScaling/" # nolint: commented_code_linter, line_length_linter.
 main <- function() { # nolint: cyclocomp_linter.
@@ -44,6 +46,23 @@ main <- function() { # nolint: cyclocomp_linter.
   base_llm_emergent_eval$Model <- toupper(
     base_llm_emergent_eval$Model
   )
+
+  # Consolidate LLAMA and QWEN model families
+  consolidate_model_family <- function(family) {
+    if (grepl("OPENLLAMA", family, ignore.case = TRUE)) {
+      return("OPENLLAMA")
+    } else if (grepl("CODELLAMA", family, ignore.case = TRUE)) {
+      return("CODELLAMA")
+    } else if (grepl("LLAMA", family)) {
+      return("LLAMA")
+    } else if (grepl("QWEN", family)) {
+      return("QWEN")
+    } else {
+      return(family)
+    }
+  }
+
+  base_llm_benchmark_eval$Model.Family <- sapply(base_llm_benchmark_eval$Model.Family, consolidate_model_family)
   ## Merge datasets by Model, all. Suffix "benchmark" and "emergent"
   base_llm <- merge(
     base_llm_benchmark_eval, base_llm_emergent_eval,
@@ -53,9 +72,28 @@ main <- function() { # nolint: cyclocomp_linter.
   base_llm[sapply(base_llm, is.character)] <- lapply(
     base_llm[sapply(base_llm, is.character)], as.factor
   )
+  # Count the number of models in each family
+  family_counts <- table(base_llm$Model.Family)
+
+  # Identify families with at least 3 models
+  valid_families <- names(family_counts[family_counts >= 3])
+
+  # Filter the dataset to keep only the valid families
+  base_llm <- base_llm[base_llm$Model.Family %in% valid_families, ]
+
+  # Re-factor Model.Family to remove unused levels
+  base_llm$Model.Family <- factor(base_llm$Model.Family)
+
   ## Summary stats
   print(summary(base_llm))
 
+  # Print the number of models remaining
+  print(paste("Number of models remaining:", nrow(base_llm)))
+
+  # Print the remaining model families and their counts
+  remaining_family_counts <- table(base_llm$Model.Family)
+  print("Remaining model families and their counts:")
+  print(remaining_family_counts)
   ## If you want to make a plot like I shared to group + emergent benchmarks
   # install.packages("PerformanceAnalytics") # nolint: commented_code_linter.
   # library(PerformanceAnalytics) # nolint: commented_code_linter.
@@ -145,6 +183,29 @@ main <- function() { # nolint: cyclocomp_linter.
   # Define the cutoff for FLOPs to split the data
   cutoff_flops <- 8.4 * 10
   # Function to fit the model with error handling
+  # Function to fit the fixed-effects model
+  fit_model_fixed <- function(formula, data) {
+    model <- tryCatch(
+      {
+        glm(formula,
+          data = data,
+          family = binomial(link = "logit")
+        )
+      },
+      warning = function(w) {
+        message("Warning in model fitting: ", w$message)
+        return(NA)
+      },
+      error = function(e) {
+        message("Error in model fitting: ", e$message)
+        return(NA)
+      },
+      finally = {
+        message("Attempted model: ", deparse(formula))
+      }
+    )
+    return(model)
+  }
   fit_model <- function(formula, data) {
     model <- tryCatch(
       {
@@ -169,20 +230,37 @@ main <- function() { # nolint: cyclocomp_linter.
     return(model)
   }
 
-  # Function to calculate model metrics
-  calculate_model_metrics <- function(model) {
-    if (!is.na(model) && class(model) != "try-error") {
-      aic_value <- AIC(model)
-      test_predictions <- predict(model,
-        newdata = test_data, re.form = NA, type = "response"
-      )
-      accuracy <- sum(round(test_data[[response_formula]] / 100, 1) == round(test_predictions, 1)) / length(test_predictions)
-      rmse <- sqrt(mean((round(test_data[[response_formula]] / 100, 2) - round(test_predictions / 100, 2))^2))
-      # r_squared <- cor(round(test_data[[response_formula]] / 100, 2), round(test_predictions / 100, 2))^2
-      return(c(aic_value, accuracy, rmse))
-    } else {
-      return(rep(NA, 3))
+  calculate_model_metrics <- function(model, test_data, response_formula) {
+    if (is.null(model) || inherits(model, "try-error") || all(is.na(model))) {
+      return(c(NA, NA, NA))
     }
+
+    tryCatch(
+      {
+        if (inherits(model, "glm")) {
+          aic_value <- AIC(model)
+          test_predictions <- predict(model, newdata = test_data, type = "response")
+        } else if (inherits(model, "glmerMod")) {
+          aic_value <- AIC(model)
+          test_predictions <- predict(model,
+            newdata = test_data, re.form = NA, type = "response"
+          )
+        } else {
+          warning("Unexpected model class")
+          return(c(NA, NA, NA))
+        }
+
+        actual_values <- test_data[[response_formula]] / 100
+        accuracy <- mean(round(actual_values, 1) == round(test_predictions, 1))
+        rmse <- sqrt(mean((actual_values - test_predictions)^2))
+
+        return(c(aic_value, accuracy, rmse))
+      },
+      error = function(e) {
+        warning("Error in calculate_model_metrics: ", e$message)
+        return(rep(NA, 3))
+      }
+    )
   }
 
   # # Container for results
@@ -214,49 +292,50 @@ main <- function() { # nolint: cyclocomp_linter.
     base_llm_clean <- base_llm[complete.cases(base_llm[c(response_formula, response_failures, "FLOPs..1E21.", "Model.Family", benchmark_minus_1)]), ]
 
     # Split data into training and testing sets
-    train_data <- base_llm_clean %>% filter(FLOPs..1E21. <= cutoff_flops) # nolint: object_usage_linter
-    test_data <- base_llm_clean %>% filter(FLOPs..1E21. > cutoff_flops) # nolint: object_usage_linter
+    train_data <- base_llm_clean %>% filter(FLOPs..1E21. <= cutoff_flops)
+    test_data <- base_llm_clean %>% filter(FLOPs..1E21. > cutoff_flops)
 
-    # Model 1: Base model with FLOPs only
+    # Model 0: Base model with FLOPs only (fixed-effects)
+    formula_base <- as.formula(paste(response, "~ 1 + log(FLOPs..1E21.)"))
+    model_base <- fit_model_fixed(formula_base, train_data)
+    base_metrics <- calculate_model_metrics(model_base, test_data, response_formula)
+    performance_metrics[nrow(performance_metrics) + 1, ] <- c(benchmark, "Flops Only", base_metrics[1], base_metrics[2], base_metrics[3])
+
+    # Model 1: Base model with FLOPs only + intercept
     formula_base <- as.formula(paste(response, "~ log(FLOPs..1E21.) + (1|Model.Family)"))
     model_base <- fit_model(formula_base, train_data)
     base_metrics <- calculate_model_metrics(model_base)
     performance_metrics[nrow(performance_metrics) + 1, ] <- c(benchmark, "Flops Only", base_metrics[1], base_metrics[2], base_metrics[3])
 
+    base_metrics <- calculate_model_metrics(model_base, test_data, response_formula)
+    performance_metrics[nrow(performance_metrics) + 1, ] <- c(benchmark, "Flops Only + intercept", base_metrics[1], base_metrics[2], base_metrics[3])
+
     # Model 2: Base model with FLOPs and benchmark minus 1
     formula_minus_1 <- as.formula(paste0(response, " ~ log(FLOPs..1E21.) + (1|Model.Family) + ", benchmark_minus_1))
     model_minus_1 <- fit_model(formula_minus_1, train_data)
-    minus_1_metrics <- calculate_model_metrics(model_minus_1)
+    minus_1_metrics <- calculate_model_metrics(model_minus_1, test_data, response_formula)
     performance_metrics[nrow(performance_metrics) + 1, ] <- c(benchmark, "Flops + n-1", minus_1_metrics[1], minus_1_metrics[2], minus_1_metrics[3])
 
     # Grid search: Add each of the other benchmarks minus 1 incrementally
+    other_benchmarks <- setdiff(benchmark_columns, benchmark)
     formula_components <- "log(FLOPs..1E21.) + (1|Model.Family)"
 
-    formulas <- lapply(seq_along(all_combinations), function(comb) {
-      components <- paste(comb, collapse = " + ")
-      formula_str <- paste(response, "~", formula_components, "+", components)
-      as.formula(formula_str)
-    })
-
-    for (formula in formulas) {
-      model_dynamic <- fit_model(formula, train_data)
-      dynamic_metrics <- calculate_model_metrics(model_dynamic)
-      if (!is.na(dynamic_metrics[1])) {
-        performance_metrics[nrow(performance_metrics) + 1, ] <- c(
-          benchmark,
-          paste(formula[3]),
-          dynamic_metrics[1],
-          dynamic_metrics[2],
-          dynamic_metrics[3]
-        )
+    for (other_benchmark in other_benchmarks) {
+      other_benchmark_minus_1 <- paste0(other_benchmark, "_minus_1")
+      if (other_benchmark_minus_1 %in% colnames(base_llm_clean)) {
+        formula_components <- paste0(formula_components, " + ", other_benchmark_minus_1)
+        formula_dynamic <- as.formula(paste0(response, " ~ ", formula_components))
+        model_dynamic <- fit_model(formula_dynamic, train_data)
+        dynamic_metrics <- calculate_model_metrics(model_dynamic)
+        performance_metrics[nrow(performance_metrics) + 1, ] <- c(benchmark, paste("Flops +", other_benchmark_minus_1), dynamic_metrics[1], dynamic_metrics[2], dynamic_metrics[3])
       }
     }
 
     # Determine the best model for this benchmark
-    # if (any(!is.na(performance_metrics$aic))) {
+    # if (any(!is.na(performance_metrics$rmse))) {
     #   best_model <- performance_metrics %>%
     #     filter(
-    #       aic == min(aic, na.rm = TRUE),
+    #       rmse == min(rmse, na.rm = TRUE),
     #     ) # nolint: object_usage_linter.
     #   best_models[[benchmark]] <- best_model
     # } else {
