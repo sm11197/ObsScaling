@@ -8,6 +8,7 @@ main <- function() { # nolint: cyclocomp_linter.
   library(ggplot2)
   library(pROC)
   library(caret)
+  library(gtools)
 
   #### DATA PREP/EXPLROATION
   ## Read in the data
@@ -148,9 +149,9 @@ main <- function() { # nolint: cyclocomp_linter.
     model <- tryCatch(
       {
         glmer(formula,
-              data = data,
-              family = binomial(link = "logit"),
-              control = glmerControl(optimizer = "bobyqa")
+          data = data,
+          family = binomial(link = "logit"),
+          control = glmerControl(optimizer = "bobyqa")
         )
       },
       warning = function(w) {
@@ -167,88 +168,104 @@ main <- function() { # nolint: cyclocomp_linter.
     )
     return(model)
   }
-  
+
   # Function to calculate model metrics
   calculate_model_metrics <- function(model) {
     if (!is.na(model) && class(model) != "try-error") {
       aic_value <- AIC(model)
-      test_predictions <- predict(model, newdata = test_data, re.form = NA, type = "response")
+      test_predictions <- predict(model,
+        newdata = test_data, re.form = NA, type = "response"
+      )
       accuracy <- sum(round(test_data[[response_formula]] / 100, 1) == round(test_predictions, 1)) / length(test_predictions)
       rmse <- sqrt(mean((round(test_data[[response_formula]] / 100, 2) - round(test_predictions / 100, 2))^2))
-      r_squared <- cor(round(test_data[[response_formula]] / 100, 2), round(test_predictions / 100, 2))^2
+      # r_squared <- cor(round(test_data[[response_formula]] / 100, 2), round(test_predictions / 100, 2))^2
       return(c(aic_value, accuracy, rmse))
     } else {
       return(rep(NA, 3))
     }
   }
-  
-  # Container for results
-  best_models <- list()
-  
+
+  # # Container for results
+  # best_models <- list()
+
+  # Container for performance metrics
+  performance_metrics <- data.frame(
+    benchmark = character(),
+    model_type = character(),
+    aic = numeric(),
+    binary_accuracy = numeric(),
+    rmse = numeric(),
+    stringsAsFactors = FALSE
+  )
+
+  benchmark_minus_1_columns <- paste0(benchmark_columns, "_minus_1")
+  all_combinations <- do.call(c, lapply(1:3, function(k) {
+    combn(benchmark_minus_1_columns, k, simplify = FALSE)
+  })) # use 1:16 for all combinations except empty set
+
   for (benchmark in benchmark_columns) {
-    performance_metrics <- data.frame(
-      benchmark = character(),
-      model_type = character(),
-      aic = numeric(),
-      binary_accuracy = numeric(),
-      rmse = numeric(),
-      stringsAsFactors = FALSE
-    )
-    
     # Dynamic responses based on current benchmark
     response_formula <- paste(benchmark, "successes", sep = "_")
     response_failures <- paste(benchmark, "failures", sep = "_")
     response <- paste("cbind(", response_formula, ",", response_failures, ")", sep = "")
     benchmark_minus_1 <- paste0(benchmark, "_minus_1")
-    
+
     # Remove NAs
     base_llm_clean <- base_llm[complete.cases(base_llm[c(response_formula, response_failures, "FLOPs..1E21.", "Model.Family", benchmark_minus_1)]), ]
-    
+
     # Split data into training and testing sets
-    train_data <- base_llm_clean %>% filter(FLOPs..1E21. <= cutoff_flops)
-    test_data <- base_llm_clean %>% filter(FLOPs..1E21. > cutoff_flops)
-    
+    train_data <- base_llm_clean %>% filter(FLOPs..1E21. <= cutoff_flops) # nolint: object_usage_linter
+    test_data <- base_llm_clean %>% filter(FLOPs..1E21. > cutoff_flops) # nolint: object_usage_linter
+
     # Model 1: Base model with FLOPs only
     formula_base <- as.formula(paste(response, "~ log(FLOPs..1E21.) + (1|Model.Family)"))
     model_base <- fit_model(formula_base, train_data)
     base_metrics <- calculate_model_metrics(model_base)
     performance_metrics[nrow(performance_metrics) + 1, ] <- c(benchmark, "Flops Only", base_metrics[1], base_metrics[2], base_metrics[3])
-    
+
     # Model 2: Base model with FLOPs and benchmark minus 1
     formula_minus_1 <- as.formula(paste0(response, " ~ log(FLOPs..1E21.) + (1|Model.Family) + ", benchmark_minus_1))
     model_minus_1 <- fit_model(formula_minus_1, train_data)
     minus_1_metrics <- calculate_model_metrics(model_minus_1)
     performance_metrics[nrow(performance_metrics) + 1, ] <- c(benchmark, "Flops + n-1", minus_1_metrics[1], minus_1_metrics[2], minus_1_metrics[3])
-    
+
     # Grid search: Add each of the other benchmarks minus 1 incrementally
-    other_benchmarks <- setdiff(benchmark_columns, benchmark)
     formula_components <- "log(FLOPs..1E21.) + (1|Model.Family)"
-    
-    for (other_benchmark in other_benchmarks) {
-      other_benchmark_minus_1 <- paste0(other_benchmark, "_minus_1")
-      if (other_benchmark_minus_1 %in% colnames(base_llm_clean)) {
-        formula_components <- paste0(formula_components, " + ", other_benchmark_minus_1)
-        formula_dynamic <- as.formula(paste0(response, " ~ ", formula_components))
-        model_dynamic <- fit_model(formula_dynamic, train_data)
-        dynamic_metrics <- calculate_model_metrics(model_dynamic)
-        performance_metrics[nrow(performance_metrics) + 1, ] <- c(benchmark, paste("Flops +", other_benchmark_minus_1), dynamic_metrics[1], dynamic_metrics[2], dynamic_metrics[3])
+
+    formulas <- lapply(seq_along(all_combinations), function(comb) {
+      components <- paste(comb, collapse = " + ")
+      formula_str <- paste(response, "~", formula_components, "+", components)
+      as.formula(formula_str)
+    })
+
+    for (formula in formulas) {
+      model_dynamic <- fit_model(formula, train_data)
+      dynamic_metrics <- calculate_model_metrics(model_dynamic)
+      if (!is.na(dynamic_metrics[1])) {
+        performance_metrics[nrow(performance_metrics) + 1, ] <- c(
+          benchmark,
+          paste(formula[3]),
+          dynamic_metrics[1],
+          dynamic_metrics[2],
+          dynamic_metrics[3]
+        )
       }
     }
 
     # Determine the best model for this benchmark
-    if (any(!is.na(performance_metrics$aic))) {
-      best_model <- performance_metrics %>%
-        filter(
-          aic == min(aic, na.rm = TRUE),
-        ) # nolint: object_usage_linter.
-      best_models[[benchmark]] <- best_model
-    } else {
-      best_models[[benchmark]] <- NA
-      message("All models failed for benchmark: ", benchmark)
-    }
+    # if (any(!is.na(performance_metrics$aic))) {
+    #   best_model <- performance_metrics %>%
+    #     filter(
+    #       aic == min(aic, na.rm = TRUE),
+    #     ) # nolint: object_usage_linter.
+    #   best_models[[benchmark]] <- best_model
+    # } else {
+    #   best_models[[benchmark]] <- NA
+    #   message("All models failed for benchmark: ", benchmark)
+    # }
   }
 
-  print(best_models)
+  # print(best_models)
   # print(performance_metrics)
 
   # Optionally, plot ROC curve for the last evaluated benchmark
