@@ -74,7 +74,6 @@ main <- function() { # nolint: function_name_linter
     base_llm_benchmark_eval$Model.Family,
     consolidate_model_family
   )
-
   ## Merge datasets by Model, all. Suffix "benchmark" and "emergent"
   base_llm <- merge(
     base_llm_benchmark_eval, base_llm_emergent_eval,
@@ -93,18 +92,14 @@ main <- function() { # nolint: function_name_linter
   base_llm <- base_llm[base_llm$Model.Family %in% valid_families, ]
   ## Re-factor Model.Family to remove unused levels
   base_llm$Model.Family <- factor(base_llm$Model.Family)
-
   ## Summary stats
   print(summary(base_llm))
-
   ## Print the number of models remaining
   print(paste("Number of models remaining:", nrow(base_llm)))
-
   ## Print the remaining model families and their counts
   remaining_family_counts <- table(base_llm$Model.Family)
   print("Remaining model families and their counts:")
   print(remaining_family_counts)
-
   ## If you want to make a plot like I shared to group + emergent benchmarks
   # install.packages("PerformanceAnalytics") # nolint: commented_code_linter.
   # library(PerformanceAnalytics) # nolint: commented_code_linter.
@@ -247,7 +242,9 @@ main <- function() { # nolint: function_name_linter
       {
         if (inherits(model, "glm")) {
           aic_value <- AIC(model)
-          test_predictions <- predict(model, newdata = test_data, type = "response")
+          test_predictions <- predict(model,
+            newdata = test_data, type = "response"
+          )
         } else if (inherits(model, "glmerMod")) {
           aic_value <- AIC(model)
           test_predictions <- predict(model,
@@ -270,7 +267,7 @@ main <- function() { # nolint: function_name_linter
   }
 
   ## Container for best results
-  # best_models <- list()
+  # best_models <- list() # nolint: commented_code_linter
   ## Container for performance metrics
   performance_metrics <- data.frame(
     benchmark = character(),
@@ -283,19 +280,24 @@ main <- function() { # nolint: function_name_linter
 
   ## Get all combinations of benchmarks for formulas
   benchmark_minus_1_columns <- paste0(benchmark_columns, "_minus_1")
-  all_combinations <- do.call(c, lapply(1:2, function(k) {
+  all_combinations <- do.call(c, lapply(1:8, function(k) {
     combn(benchmark_minus_1_columns, k, simplify = FALSE)
   })) # use 1:16 for all combinations except empty set
 
-  for (benchmark in benchmark_columns) {
+  for (benchmark in benchmark_columns[length(benchmark_columns):1]) {
     ## Dynamic responses (Y) based on current benchmark
     response_formula <- paste(benchmark, "successes", sep = "_")
     response_failures <- paste(benchmark, "failures", sep = "_")
-    response <- paste("cbind(", response_formula, ",", response_failures, ")", sep = "")
+    response <- paste("cbind(", response_formula, ",", response_failures, ")",
+      sep = ""
+    )
     benchmark_minus_1 <- paste0(benchmark, "_minus_1")
 
     ## Remove NAs # TODO:dynamic depending on formula
-    base_llm_clean <- base_llm[complete.cases(base_llm[c(response_formula, response_failures, "FLOPs..1E21.", "Model.Family", benchmark_minus_1)]), ]
+    base_llm_clean <- base_llm[complete.cases(base_llm[c(
+      response_formula, response_failures,
+      "FLOPs..1E21.", "Model.Family", benchmark_minus_1
+    )]), ]
 
     ## Split data into training and testing sets # dynamic as well?
     train_data <- base_llm_clean %>% filter(FLOPs..1E21. <= cutoff_flops) # nolint: object_usage_linter
@@ -304,26 +306,53 @@ main <- function() { # nolint: function_name_linter
     ## Model 0: Base model with FLOPs only (fixed-effects)
     formula_base <- as.formula(paste(response, "~ 1 + log(FLOPs..1E21.)"))
     model_base <- fit_model_fixed(formula_base, train_data)
-    base_metrics <- calculate_model_metrics(model_base, test_data, response_formula)
-    performance_metrics[nrow(performance_metrics) + 1, ] <- c(benchmark, "Flops Only", base_metrics[1], base_metrics[2], base_metrics[3])
+    base_metrics <- calculate_model_metrics(model_base, test_data, response_formula) # nolint: object_usage_linter
+    performance_metrics[nrow(performance_metrics) + 1, ] <- c(
+      benchmark, "Flops Only",
+      base_metrics[1], base_metrics[2], base_metrics[3]
+    )
 
     ## Model 1: Base model with FLOPs only + random family intercepts
-    formula_base <- as.formula(paste(response, "~ log(FLOPs..1E21.) + (1|Model.Family)"))
+    formula_base <- as.formula(paste(
+      response,
+      "~ log(FLOPs..1E21.) + (1|Model.Family)"
+    ))
     model_base <- fit_model(formula_base, train_data)
-    base_metrics <- calculate_model_metrics(model_base, test_data, response_formula)
-    performance_metrics[nrow(performance_metrics) + 1, ] <- c(benchmark, "Flops Only + intercept", base_metrics[1], base_metrics[2], base_metrics[3])
+    base_metrics <- calculate_model_metrics(model_base, test_data, response_formula) # nolint: object_usage_linter
+    performance_metrics[nrow(performance_metrics) + 1, ] <- c(
+      benchmark, "Flops Only + intercept",
+      base_metrics[1], base_metrics[2], base_metrics[3]
+    )
 
     ## Model 1.5: Base model with FLOPs only + random family intercepts & slopes
-    formula_base <- as.formula(paste(response, "~ log(FLOPs..1E21.) + (1 + log(FLOPs..1E21.)|Model.Family)"))
+    formula_base <- as.formula(paste(
+      response,
+      "~ log(FLOPs..1E21.) + (1 + log(FLOPs..1E21.)|Model.Family)"
+    ))
     model_base <- fit_model(formula_base, train_data)
-    base_metrics <- calculate_model_metrics(model_base, test_data, response_formula)
-    performance_metrics[nrow(performance_metrics) + 1, ] <- c(benchmark, "Flops Only + intercept-slope", base_metrics[1], base_metrics[2], base_metrics[3])
+    base_metrics <- calculate_model_metrics(
+      model_base,
+      test_data, response_formula
+    )
+    performance_metrics[nrow(performance_metrics) + 1, ] <- c(
+      benchmark, "Flops Only + intercept-slope",
+      base_metrics[1], base_metrics[2], base_metrics[3]
+    )
 
-    ## Model 2: Base model with FLOPs, random family intercept, benchmark_minus_1
-    formula_minus_1 <- as.formula(paste0(response, " ~ log(FLOPs..1E21.) + (1|Model.Family) + ", benchmark_minus_1))
+    ## Model 2: Base model with FLOPs, random family intercept, benchmark_minus_1 # nolint
+    formula_minus_1 <- as.formula(paste0(
+      response,
+      " ~ log(FLOPs..1E21.) + (1|Model.Family) + ", benchmark_minus_1
+    ))
     model_minus_1 <- fit_model(formula_minus_1, train_data)
-    minus_1_metrics <- calculate_model_metrics(model_minus_1, test_data, response_formula)
-    performance_metrics[nrow(performance_metrics) + 1, ] <- c(benchmark, "Flops + intercept + n-1", minus_1_metrics[1], minus_1_metrics[2], minus_1_metrics[3])
+    minus_1_metrics <- calculate_model_metrics(
+      model_minus_1,
+      test_data, response_formula
+    )
+    performance_metrics[nrow(performance_metrics) + 1, ] <- c(
+      benchmark, "Flops + intercept + n-1",
+      minus_1_metrics[1], minus_1_metrics[2], minus_1_metrics[3]
+    )
 
     ## TODO: generalize the above?
 
@@ -336,7 +365,10 @@ main <- function() { # nolint: function_name_linter
     })
     for (formula in formulas) {
       model_dynamic <- fit_model(formula, train_data)
-      dynamic_metrics <- calculate_model_metrics(model_dynamic, test_data, response_formula)
+      dynamic_metrics <- calculate_model_metrics(
+        model_dynamic,
+        test_data, response_formula
+      )
       if (!is.na(dynamic_metrics[1])) {
         performance_metrics[nrow(performance_metrics) + 1, ] <- c(
           benchmark,
@@ -354,22 +386,22 @@ main <- function() { # nolint: function_name_linter
     # if (any(!is.na(performance_metrics$rmse))) {
     #   best_model <- performance_metrics %>%
     #     filter(
-    #       rmse == min(rmse, na.rm = TRUE),
+    #       rmse == min(rmse, na.rm = TRUE), # nolint: object_usage_linter
     #     ) # nolint: object_usage_linter.
-    #   best_models[[benchmark]] <- best_model
+    #   best_models[[benchmark]] <- best_model # nolint: commented_code_linter
     # } else {
-    #   best_models[[benchmark]] <- NA
-    #   message("All models failed for benchmark: ", benchmark)
+    #   best_models[[benchmark]] <- NA # nolint: commented_code_linter
+    #   message("All models failed for benchmark: ", benchmark) # nolint: commented_code_linter
     # }
   }
 
-  # print(best_models)
-  # print(performance_metrics)
+  # print(best_models) # nolint: commented_code_linter
+  # print(performance_metrics) # nolint: commented_code_linter
 
   # Optionally, plot ROC curve for the last evaluated benchmark
-  # plot(roc_obj)
+  # plot(roc_obj) # nolint: commented_code_linter
 
-  write.csv(performance_metrics, file.path(getwd(), "performance_metrics.csv"))
+  write.csv2(performance_metrics, file.path(getwd(), "performance_metrics.csv"))
 }
 
 main()
