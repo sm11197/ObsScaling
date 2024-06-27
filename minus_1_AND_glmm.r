@@ -26,7 +26,7 @@ main <- function() { # nolint: function_name_linter
   setwd(args[1])
   base_llm_benchmark_eval <- read.csv(file.path(
     getwd(),
-    "/eval_results/base_llm_benchmark_eval.csv"
+    "/eval_results/base_llm_benchmark_pca_imputed.csv"
   ))
   base_llm_emergent_eval <- read.csv(file.path(
     getwd(),
@@ -92,6 +92,12 @@ main <- function() { # nolint: function_name_linter
   base_llm <- base_llm[base_llm$Model.Family %in% valid_families, ]
   ## Re-factor Model.Family to remove unused levels
   base_llm$Model.Family <- factor(base_llm$Model.Family)
+  # Divide ipa_transliterate_2_bleu by 100
+  if ("ipa_transliterate_2_bleu" %in% names(base_llm)) {
+    base_llm$ipa_transliterate_2_bleu <- base_llm$ipa_transliterate_2_bleu / 100
+  }
+  # Remove ipa_transliterate_2_bleu column if it exists TODO fix this by running this benchmark
+  base_llm$ipa_transliterate_2_bleu <- NULL
   ## Summary stats
   print(summary(base_llm))
   ## Print the number of models remaining
@@ -100,6 +106,8 @@ main <- function() { # nolint: function_name_linter
   remaining_family_counts <- table(base_llm$Model.Family)
   print("Remaining model families and their counts:")
   print(remaining_family_counts)
+
+
   ## If you want to make a plot like I shared to group + emergent benchmarks
   # install.packages("PerformanceAnalytics") # nolint: commented_code_linter.
   # library(PerformanceAnalytics) # nolint: commented_code_linter.
@@ -358,8 +366,13 @@ main <- function() { # nolint: function_name_linter
 
     ## Grid search #### 06/26, FLOPs, family intercepts,
     formula_components <- "log(FLOPs..1E21.) + (1|Model.Family)"
-    formulas <- lapply(seq_along(all_combinations), function(comb) {
-      components <- paste(all_combinations[comb], collapse = " + ")
+    # formulas <- lapply(seq_along(all_combinations), function(comb) {
+    #  components <- paste(all_combinations[comb], collapse = " + ")
+    #  formula_str <- paste(response, "~", formula_components, "+", components)
+    #  as.formula(formula_str)
+    # })
+    formulas <- lapply(all_combinations, function(comb) {
+      components <- paste(comb, collapse = " + ")
       formula_str <- paste(response, "~", formula_components, "+", components)
       as.formula(formula_str)
     })
@@ -371,11 +384,11 @@ main <- function() { # nolint: function_name_linter
       )
       if (!is.na(dynamic_metrics[1])) {
         performance_metrics[nrow(performance_metrics) + 1, ] <- c(
-          benchmark,
-          paste(formula[3]),
-          dynamic_metrics[1],
-          dynamic_metrics[2],
-          dynamic_metrics[3]
+        benchmark,
+        deparse(formula),
+        dynamic_metrics[1],
+        dynamic_metrics[2],
+        dynamic_metrics[3]
         )
       }
     }
