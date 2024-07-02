@@ -1,18 +1,64 @@
 # args[1] <- "~/git/predicting-capabilities/ObsScaling/" # nolint: commented_code_linter, line_length_linter.
 main <- function() { # nolint: function_name_linter
+  options(repos = c(CRAN = "https://cloud.r-project.org"))
   args <- commandArgs(trailingOnly = TRUE)
   #### Libraries ####
   ## List of required packages in alphabetical order
-  packages <- c("caret", "dplyr", "ggplot2", "gtools", "lme4", "pROC")
-  ## Function to install missing packages and load them
+  # Install devtools if you haven't already
+  
   install_and_load <- function(pkg) {
-    if (!require(pkg, character.only = TRUE)) {
+  if (!require(pkg, character.only = TRUE)) {
+    # Set a CRAN mirror if not already set
+    if (length(getOption("repos")) == 0 || getOption("repos")["CRAN"] == "@CRAN@") {
+      options(repos = c(CRAN = "https://cloud.r-project.org"))
+    }
+    
+    # Try to install the package
+    tryCatch({
       install.packages(pkg, dependencies = TRUE)
-      library(pkg, character.only = TRUE)
+    }, error = function(e) {
+      message(paste("Failed to install package:", pkg))
+      message("Error message:", e$message)
+      return(FALSE)
+    })
+    
+    # Try to load the package
+    if (!require(pkg, character.only = TRUE)) {
+      message(paste("Package", pkg, "is not available and could not be installed."))
+      return(FALSE)
     }
   }
-  ## Apply the function to the list of packages
-  lapply(packages, install_and_load)
+  return(TRUE)
+}
+
+
+# List of required packages
+packages <- c("caret", "dplyr", "ggplot2", "gtools", "lme4", "pROC", "glmmTMB")
+
+
+# Try to install and load each package
+installed_packages <- sapply(packages, install_and_load)
+if (!requireNamespace("devtools", quietly = TRUE)) {
+  install.packages("devtools")
+}
+library(devtools)
+tryCatch(
+  {
+    install_version("TMB", version = "1.9.11", repos = "https://cloud.r-project.org")
+    detach("package:glmmTMB", unload = TRUE)
+    remove.packages("glmmTMB")
+    install.packages("glmmTMB")
+  },
+  error = function(e) {
+    message("Error installing packages: ", e$message)
+  }
+)
+
+# Check if all packages were successfully installed and loaded
+if (!all(installed_packages)) {
+  message("Not all required packages could be installed. Please check the error messages above.")
+  message("Proceeding with available packages...")
+}
   ## Load packages
   library(caret)
   library(dplyr)
@@ -56,6 +102,8 @@ main <- function() { # nolint: function_name_linter
     base_llm_emergent_eval$Model
   )
 
+  emergent_benchmarks <- names(base_llm_emergent_eval)[!names(base_llm_emergent_eval) %in% c("Model", "Repo")]
+
   ## Consolidate LLAMA and QWEN model families ####
   consolidate_model_family <- function(family) {
     if (grepl("OPENLLAMA", family, ignore.case = TRUE)) {
@@ -86,8 +134,12 @@ main <- function() { # nolint: function_name_linter
 
   ## Count the number of models in each family ####
   family_counts <- table(base_llm$Model.Family)
+  print("Model families:")
+  print(family_counts)
   ## Identify families with at least 2 models
-  valid_families <- names(family_counts[family_counts >= 2])
+  valid_families <- names(family_counts[family_counts > 2])
+  print("Model families with more than 2 models:")
+  print(valid_families)
   ## Filter the dataset to keep only the valid families
   base_llm <- base_llm[base_llm$Model.Family %in% valid_families, ]
   ## Re-factor Model.Family to remove unused levels
@@ -183,11 +235,6 @@ main <- function() { # nolint: function_name_linter
         get_minus_1_normalized(idx, base_llm, benchmark)
       }
     )
-    ## Dynamically create successes and failures columns as well for response
-    base_llm[[paste(benchmark, "successes", sep = "_")]] <-
-      round(base_llm[[benchmark]] * number_of_trials)
-    base_llm[[paste(benchmark, "failures", sep = "_")]] <-
-      number_of_trials - base_llm[[paste(benchmark, "successes", sep = "_")]]
   }
   # base_llm : 107 rows, 71 cols 06/19 || 06/26 base_llm 101, 71
 
@@ -195,13 +242,11 @@ main <- function() { # nolint: function_name_linter
   ## Define the cutoff for FLOPs to split the data
   cutoff_flops <- 8.4 * 10
   ## Function to fit the fixed-effects model with error handling
+  
   fit_model_fixed <- function(formula, data) {
     model <- tryCatch(
       {
-        glm(formula,
-          data = data,
-          family = binomial(link = "logit")
-        )
+      glm(formula, data = data, family = quasibinomial(link = "logit"))
       },
       warning = function(w) {
         message("Warning in model fitting: ", w$message)
@@ -218,22 +263,25 @@ main <- function() { # nolint: function_name_linter
     return(model)
   }
   ## Function to fit the mixed-effects model with error handling
+
+  library(glmmTMB)
   fit_model <- function(formula, data) {
     model <- tryCatch(
       {
-        glmer(formula,
+        print(formula)
+        glmmTMB(formula,
           data = data,
-          family = binomial(link = "logit"),
-          control = glmerControl(optimizer = "bobyqa")
+          family = beta_family(link = "logit"),
+          control = glmmTMBControl(optimizer = nlminb)
         )
       },
       warning = function(w) {
         message("Warning in model fitting: ", w$message)
-        return(NA)
+        return(w)
       },
       error = function(e) {
         message("Error in model fitting: ", e$message)
-        return(NA)
+        return(e)
       },
       finally = {
         message("Attempted model: ", deparse(formula))
@@ -241,34 +289,37 @@ main <- function() { # nolint: function_name_linter
     )
     return(model)
   }
+      
   ## Function to get model metrics with error handling
   calculate_model_metrics <- function(model, test_data, response_formula) {
     if (is.null(model) || inherits(model, "try-error") || all(is.na(model))) {
+      message("Model is null, an error, or all NA")
       return(rep(NA, 3))
     }
     tryCatch(
       {
         if (inherits(model, "glm")) {
+          aic_value <- NA  # AIC is not available for quasi-models
+          test_predictions <- predict(model, newdata = test_data, type = "response")
+        } else if (inherits(model, "glmmTMB")) {
           aic_value <- AIC(model)
-          test_predictions <- predict(model,
-            newdata = test_data, type = "response"
-          )
-        } else if (inherits(model, "glmerMod")) {
-          aic_value <- AIC(model)
-          test_predictions <- predict(model,
-            newdata = test_data, re.form = NA, type = "response"
-          )
+          test_predictions <- predict(model, newdata = test_data, type = "response")
         } else {
-          warning("Unexpected model class")
+          warng("Unexpected model class: ", class(model))
           return(c(NA, NA, NA))
         }
-        actual_values <- test_data[[response_formula]] / 100
-        accuracy <- mean(round(actual_values, 1) == round(test_predictions, 1))
+        actual_values <- test_data[[response_formula]]
         rmse <- sqrt(mean((actual_values - test_predictions)^2))
-        return(c(aic_value, accuracy, rmse))
+        print(paste("RMSE:", rmse))
+        r_squared <- cor(actual_values, test_predictions)^2
+        print(paste("R-squared:", r_squared))
+        return(c(aic_value, r_squared, rmse))
       },
       error = function(e) {
         warning("Error in calculate_model_metrics: ", e$message)
+        # print("Error occurred with model of class:", paste(class(model), collapse = ", "))
+        # print("Response formula:", response_formula)
+        # print("Test data columns:", names(test_data))
         return(rep(NA, 3))
       }
     )
@@ -288,22 +339,24 @@ main <- function() { # nolint: function_name_linter
 
   ## Get all combinations of benchmarks for formulas
   benchmark_minus_1_columns <- paste0(benchmark_columns, "_minus_1")
-  all_combinations <- do.call(c, lapply(1:8, function(k) {
+  all_combinations <- do.call(c, lapply(1:1, function(k) {
     combn(benchmark_minus_1_columns, k, simplify = FALSE)
   })) # use 1:16 for all combinations except empty set
+  
+  emergent_benchmark_columns <- benchmark_columns[benchmark_columns %in% emergent_benchmarks]
 
-  for (benchmark in benchmark_columns[length(benchmark_columns):1]) {
+  for (benchmark in emergent_benchmark_columns[length(emergent_benchmark_columns):1]) {
     ## Dynamic responses (Y) based on current benchmark
-    response_formula <- paste(benchmark, "successes", sep = "_")
-    response_failures <- paste(benchmark, "failures", sep = "_")
-    response <- paste("cbind(", response_formula, ",", response_failures, ")",
-      sep = ""
-    )
+    response_formula <- benchmark
+    response <- benchmark
+    # response_formula <- paste(benchmark, "successes", sep = "_")
+    # response_failures <- paste(benchmark, "failures", sep = "_")
+
     benchmark_minus_1 <- paste0(benchmark, "_minus_1")
 
     ## Remove NAs # TODO:dynamic depending on formula
     base_llm_clean <- base_llm[complete.cases(base_llm[c(
-      response_formula, response_failures,
+      response_formula,
       "FLOPs..1E21.", "Model.Family", benchmark_minus_1
     )]), ]
 
@@ -325,6 +378,8 @@ main <- function() { # nolint: function_name_linter
       response,
       "~ log(FLOPs..1E21.) + (1|Model.Family)"
     ))
+    print(response)
+    print(benchmark)
     model_base <- fit_model(formula_base, train_data)
     base_metrics <- calculate_model_metrics(model_base, test_data, response_formula) # nolint: object_usage_linter
     performance_metrics[nrow(performance_metrics) + 1, ] <- c(
@@ -385,7 +440,30 @@ main <- function() { # nolint: function_name_linter
       if (!is.na(dynamic_metrics[1])) {
         performance_metrics[nrow(performance_metrics) + 1, ] <- c(
         benchmark,
-        deparse(formula),
+        gsub("\\s+", " ", paste(deparse(formula), collapse = "")),  # 
+        dynamic_metrics[1],
+        dynamic_metrics[2],
+        dynamic_metrics[3]
+        )
+      }
+    }
+
+    formula_components <- "1 + log(FLOPs..1E21.)"
+    formulas <- lapply(all_combinations, function(comb) {
+      components <- paste(comb, collapse = " + ")
+      formula_str <- paste(response, "~", formula_components, "+", components)
+      as.formula(formula_str)
+    })
+    for (formula in formulas) {
+      model_dynamic <- fit_model_fixed(formula, train_data)
+      dynamic_metrics <- calculate_model_metrics(
+        model_dynamic,
+        test_data, response_formula
+      )
+      if (!is.na(dynamic_metrics[1])) {
+        performance_metrics[nrow(performance_metrics) + 1, ] <- c(
+        benchmark,
+        gsub("\\s+", " ", paste(deparse(formula), collapse = "")),  # 
         dynamic_metrics[1],
         dynamic_metrics[2],
         dynamic_metrics[3]
@@ -406,6 +484,8 @@ main <- function() { # nolint: function_name_linter
     #   best_models[[benchmark]] <- NA # nolint: commented_code_linter
     #   message("All models failed for benchmark: ", benchmark) # nolint: commented_code_linter
     # }
+    print("writing...")
+    write.csv2(performance_metrics, file.path(getwd(), "performance_metrics.csv"))
   }
 
   # print(best_models) # nolint: commented_code_linter
@@ -414,7 +494,7 @@ main <- function() { # nolint: function_name_linter
   # Optionally, plot ROC curve for the last evaluated benchmark
   # plot(roc_obj) # nolint: commented_code_linter
 
-  write.csv2(performance_metrics, file.path(getwd(), "performance_metrics.csv"))
+
 }
 
 main()
