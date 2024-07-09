@@ -438,6 +438,8 @@ if (!all(installed_packages)) {
         test_data, response_formula
       )
       if (!is.na(dynamic_metrics[1])) {
+        print("Writing to performance metrics...")
+        print(gsub("\\s+", " ", paste(deparse(formula), collapse = "")))
         performance_metrics[nrow(performance_metrics) + 1, ] <- c(
         benchmark,
         gsub("\\s+", " ", paste(deparse(formula), collapse = "")),  # 
@@ -458,17 +460,16 @@ if (!all(installed_packages)) {
       model_dynamic <- fit_model_fixed(formula, train_data)
       dynamic_metrics <- calculate_model_metrics(
         model_dynamic,
-        test_data, response_formula
+        test_data, response_formula)
+      print("Writing to performance metrics...")
+      print(gsub("\\s+", " ", paste(deparse(formula), collapse = "")))
+      performance_metrics[nrow(performance_metrics) + 1, ] <- c(
+      benchmark,
+      gsub("\\s+", " ", paste(deparse(formula), collapse = "")),  # 
+      dynamic_metrics[1],
+      dynamic_metrics[2],
+      dynamic_metrics[3]
       )
-      if (!is.na(dynamic_metrics[1])) {
-        performance_metrics[nrow(performance_metrics) + 1, ] <- c(
-        benchmark,
-        gsub("\\s+", " ", paste(deparse(formula), collapse = "")),  # 
-        dynamic_metrics[1],
-        dynamic_metrics[2],
-        dynamic_metrics[3]
-        )
-      }
     }
 
     ## Determine the best model for this benchmark
