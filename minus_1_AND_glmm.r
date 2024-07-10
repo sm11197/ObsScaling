@@ -33,7 +33,7 @@ main <- function() { # nolint: function_name_linter
 
 
 # List of required packages
-packages <- c("caret", "dplyr", "ggplot2", "gtools", "lme4", "pROC", "glmmTMB")
+packages <- c("caret", "dplyr", "ggplot2", "gtools", "lme4", "pROC", "glmmTMB", "glmtlp")
 
 
 # Try to install and load each package
@@ -66,7 +66,6 @@ if (!all(installed_packages)) {
   library(gtools)
   library(lme4)
   library(pROC)
-
   #### DATA PREP/EXPLORATION ####
   ## Read in the data
   setwd(args[1])
@@ -176,6 +175,14 @@ if (!all(installed_packages)) {
   base_llm <- base_llm %>%
     arrange(Model.Family, FLOPs..1E21.) # nolint: object_usage_linter.
   ## Function to find n-1 benchmark score of the smaller model
+  logit <- function(p) {
+    log(p / (1 - p))
+  }
+
+  inverse_logit <- function(x) {
+    1 / (1 + exp(-x))
+  }
+
   get_minus_1_normalized <- function(model_index, data, benchmark_column) {
     current_family <- data$Model.Family[model_index]
     current_flops <- data$FLOPs..1E21.[model_index]
@@ -262,8 +269,42 @@ if (!all(installed_packages)) {
     )
     return(model)
   }
-  ## Function to fit the mixed-effects model with error handling
 
+  ## Function to fit the fixed-effects model with L1 penalty
+  library(glmtlp)
+  fit_model_fixed_l1 <- function(formula, data) {
+    model <- tryCatch(
+      {
+        mf <- model.frame(formula, data)
+        y <- model.response(mf)
+        
+        # Apply logit transformation to y
+        y_transformed <- logit(pmax(pmin(y, 1 - 1e-10), 1e-10))
+        
+        X <- model.matrix(formula, data)[,-1]  # Remove intercept column
+        
+        glmtlp(X = X, 
+               y = y_transformed, 
+               family = "gaussian", 
+               penalty = "l1",
+               standardize = TRUE)
+      },
+      warning = function(w) {
+        message("Warning in model fitting: ", w$message)
+        return(NA)
+      },
+      error = function(e) {
+        message("Error in model fitting: ", e$message)
+        return(NA)
+      },
+      finally = {
+        message("Attempted model: ", deparse(formula))
+      }
+    )
+    return(model)
+  }
+
+  ## Function to fit the mixed-effects model with error handling
   library(glmmTMB)
   fit_model <- function(formula, data) {
     model <- tryCatch(
@@ -304,6 +345,17 @@ if (!all(installed_packages)) {
         } else if (inherits(model, "glmmTMB")) {
           aic_value <- AIC(model)
           test_predictions <- predict(model, newdata = test_data, type = "response")
+        } else if (inherits(model, "glmtlp")) {
+          best_lambda_index <- which.min(model$lambda)
+          coefficients <- coef(model)[,best_lambda_index]
+          
+          X_test <- model.matrix(as.formula(paste(response_formula, "~ .")), test_data)[,-1]
+          test_predictions_transformed <- X_test %*% coefficients[-1] + coefficients[1]
+          
+          # Transform predictions back to original scale
+          test_predictions <- inverse_logit(test_predictions_transformed)
+          
+          aic_value <- NA  # AIC is not directly available for glmtlp models
         } else {
           warng("Unexpected model class: ", class(model))
           return(c(NA, NA, NA))
@@ -339,7 +391,7 @@ if (!all(installed_packages)) {
 
   ## Get all combinations of benchmarks for formulas
   benchmark_minus_1_columns <- paste0(benchmark_columns, "_minus_1")
-  all_combinations <- do.call(c, lapply(1:1, function(k) {
+  all_combinations <- do.call(c, lapply(1:3, function(k) {
     combn(benchmark_minus_1_columns, k, simplify = FALSE)
   })) # use 1:16 for all combinations except empty set
   
@@ -464,6 +516,29 @@ if (!all(installed_packages)) {
       print("Writing to performance metrics...")
       print(gsub("\\s+", " ", paste(deparse(formula), collapse = "")))
       performance_metrics[nrow(performance_metrics) + 1, ] <- c(
+      benchmark,
+      gsub("\\s+", " ", paste(deparse(formula), collapse = "")),  # 
+      dynamic_metrics[1],
+      dynamic_metrics[2],
+      dynamic_metrics[3]
+      )
+    }
+
+    formula_components <- "1 + log(FLOPs..1E21.)"
+    formulas <- lapply(all_combinations, function(comb) {
+      components <- paste(comb, collapse = " + ")
+      formula_str <- paste(response, "~", formula_components, "+", components)
+      as.formula(formula_str)
+    })
+    for (formula in formulas) {
+      model_dynamic <- fit_model_fixed_l1(formula, train_data)
+      dynamic_metrics <- calculate_model_metrics(
+        model_dynamic,
+        test_data, response_formula)
+      print("Writing to performance metrics...")
+      print(gsub("\\s+", " ", paste(deparse(formula), collapse = "")))
+      performance_metrics[nrow(performance_metrics) + 1, ] <- c(
+      "l1",
       benchmark,
       gsub("\\s+", " ", paste(deparse(formula), collapse = "")),  # 
       dynamic_metrics[1],
