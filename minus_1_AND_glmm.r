@@ -45,7 +45,10 @@ main <- function() { # nolint: function_name_linter
   library(devtools)
   tryCatch(
     {
-      install_version("TMB", version = "1.9.11", repos = "https://cloud.r-project.org")
+      remove.packages("Matrix")
+      devtools::install_version("Matrix", version = "1.6-2", repos = "https://cloud.r-project.org")
+      remove.packages("TMB")
+      install_version("TMB", version = "1.9.10", repos = "https://cloud.r-project.org")
       detach("package:glmmTMB", unload = TRUE)
       remove.packages("glmmTMB")
       install.packages("glmmTMB")
@@ -68,6 +71,7 @@ main <- function() { # nolint: function_name_linter
   library(lme4)
   library(pROC)
   library(missMDA)
+  library(glmmTMB)
 
   #### DATA PREP/EXPLORATION ####
   ## Read in the data
@@ -331,28 +335,26 @@ main <- function() { # nolint: function_name_linter
     return(list(train_data = train_final_df, test_data = test_final_df))
   }
   ## Function to fit the fixed-effects model with error handling
-
-  fit_model_fixed <- function(formula, data) {
-    model <- tryCatch(
-      {
-        glm(formula, data = data, family = quasibinomial(link = "logit"))
-      },
-      warning = function(w) {
-        message("Warning in model fitting: ", w$message)
-        return(NA)
-      },
-      error = function(e) {
-        message("Error in model fitting: ", e$message)
-        return(NA)
-      },
-      finally = {
-        message("Attempted model: ", deparse(formula))
-      }
-    )
-    return(model)
-  }
+  # fit_model_fixed <- function(formula, data) {
+  #   model <- tryCatch(
+  #     {
+  #       glm(formula, data = data, family = quasibinomial(link = "logit"))
+  #     },
+  #     warning = function(w) {
+  #       message("Warning in model fitting: ", w$message)
+  #       return(NA)
+  #     },
+  #     error = function(e) {
+  #       message("Error in model fitting: ", e$message)
+  #       return(NA)
+  #     },
+  #     finally = {
+  #       message("Attempted model: ", deparse(formula))
+  #     }
+  #   )
+  #   return(model)
+  # }
   ## Function to fit the mixed-effects model with error handling
-
   library(glmmTMB)
   fit_model <- function(formula, data) {
     model <- tryCatch(
@@ -361,7 +363,8 @@ main <- function() { # nolint: function_name_linter
         glmmTMB(formula,
           data = data,
           family = beta_family(link = "logit"),
-          control = glmmTMBControl(optimizer = nlminb)
+          control = glmmTMBControl(optimizer = optim, 
+                                   optArgs = list(method = "BFGS", maxit = 10000))
         )
       },
       warning = function(w) {
@@ -378,7 +381,6 @@ main <- function() { # nolint: function_name_linter
     )
     return(model)
   }
-
   ## Function to get model metrics with error handling
   calculate_model_metrics <- function(model, test_data, response_formula) {
     if (is.null(model) || inherits(model, "try-error") || all(is.na(model))) {
@@ -394,7 +396,7 @@ main <- function() { # nolint: function_name_linter
           aic_value <- AIC(model)
           test_predictions <- predict(model, newdata = test_data, type = "response")
         } else {
-          warng("Unexpected model class: ", class(model))
+          warning("Unexpected model class: ", class(model))
           return(c(NA, NA, NA))
         }
         actual_values <- test_data[[response_formula]]
@@ -413,7 +415,6 @@ main <- function() { # nolint: function_name_linter
       }
     )
   }
-
   ## Container for best results
   # best_models <- list() # nolint: commented_code_linter
   ## Container for performance metrics
@@ -450,20 +451,19 @@ main <- function() { # nolint: function_name_linter
     )]), ]
 
     ## Split data into training and testing sets # dynamic as well?
-    train_df <- base_llm %>% filter(FLOPs..1E21. <= cutoff_flops) # nolint: object_usage_linter
-    test_df <- base_llm %>% filter(FLOPs..1E21. > cutoff_flops) # nolint: object_usage_linter
+    train_df <- base_llm_clean %>% filter(FLOPs..1E21. <= cutoff_flops) # nolint: object_usage_linter
+    test_df <- base_llm_clean %>% filter(FLOPs..1E21. > cutoff_flops) # nolint: object_usage_linter
 
     ## Perform PCA imputation on sets without family
-    response_vars <- c(response_formula, response_failures)
-    result <- pca_impute(train_df, response_vars, test_df, n_components = 2, max_iter = 100, tol = 1e-4, boundary = c(0, 100), verbose = TRUE)
+    ## result <- pca_impute(train_df, response, test_df, n_components = 2, max_iter = 100, tol = 1e-4, boundary = c(0, 100), verbose = TRUE)
 
-    ## Change sets to imputed sets, add family back
-    train_data <- result$train_data
-    test_data <- result$test_data
+    ## Change sets to imputed sets, add family back # not for now, should be result$train_data
+    train_data <- train_df
+    test_data <- test_df
 
     ## Model 0: Base model with FLOPs only (fixed-effects)
     formula_base <- as.formula(paste(response, "~ 1 + log(FLOPs..1E21. + 0.001)"))
-    model_base <- fit_model_fixed(formula_base, train_data)
+    model_base <- fit_model(formula_base, train_data)
     base_metrics <- calculate_model_metrics(model_base, test_data, response_formula) # nolint: object_usage_linter
     performance_metrics[nrow(performance_metrics) + 1, ] <- c(
       benchmark, "Flops Only",
@@ -471,14 +471,18 @@ main <- function() { # nolint: function_name_linter
     )
 
     ## Model 1: Base model with FLOPs only + random family intercepts
-    formula_base <- as.formula(paste(
-      response,
-      "~ log(FLOPs..1E21. + 0.001) + (1|Model.Family)"
-    ))
-    print(response)
-    print(benchmark)
-    model_base <- fit_model(formula_base, train_data)
-    base_metrics <- calculate_model_metrics(model_base, test_data, response_formula) # nolint: object_usage_linter
+    train_data_filtered <- train_data[!train_data$Model.Family %in% names(which(table(train_data$Model.Family) == 0)), ]
+    train_data_filtered$Model.Family <- factor(train_data_filtered$Model.Family)
+    formula_base_1 <- as.formula(paste(response, "~ log(FLOPs..1E21. + 0.001) + (1|Model.Family)"))
+    model_base_1 <- fit_model(formula_base_1, train_data_filtered)
+    model_base_1 <- glmmTMB(formula_base_1,
+            data = train_data_filtered,
+            family = beta_family(link = "logit"),
+            control = glmmTMBControl(optimizer = optim, 
+                                     optArgs = list(method = "BFGS", maxit = 10000)),
+            start = list(theta = 0)
+    )
+    base_metrics <- calculate_model_metrics(model_base_1, test_data, response_formula) # Assuming 'model_base' should be 'model_base_1'
     performance_metrics[nrow(performance_metrics) + 1, ] <- c(
       benchmark, "Flops Only + intercept",
       base_metrics[1], base_metrics[2], base_metrics[3]
@@ -504,7 +508,7 @@ main <- function() { # nolint: function_name_linter
       response,
       " ~ log(FLOPs..1E21. + 0.001) + ", benchmark_minus_1
     ))
-    model_minus_1 <- fit_model_fixed(formula_minus_1, train_data)
+    model_minus_1 <- fit_model(formula_minus_1, train_data)
     minus_1_metrics <- calculate_model_metrics(
       model_minus_1,
       test_data, response_formula
@@ -517,7 +521,7 @@ main <- function() { # nolint: function_name_linter
     ## TODO: generalize the above?
 
     ## Grid search #### 06/26, FLOPs, family intercepts,
-    formula_components <- "log(FLOPs..1E21.) + (1|Model.Family)"
+    formula_components <- "log(FLOPs..1E21.)"
     # formulas <- lapply(seq_along(all_combinations), function(comb) {
     #  components <- paste(all_combinations[comb], collapse = " + ")
     #  formula_str <- paste(response, "~", formula_components, "+", components)
