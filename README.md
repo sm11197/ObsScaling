@@ -1,5 +1,6 @@
 # Observational Scaling Laws
 
+To run RScript: RScript minus_1_AND_glmm.r "PATH_TO_OBSSCALING_REPO"
 
 <!-- <div align="center" style="font-size: 28px;">
     [<a href="https://arxiv.org/abs/2405.10938">📃 Paper</a>] &nbsp;&nbsp;&nbsp;
