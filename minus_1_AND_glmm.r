@@ -1,21 +1,65 @@
 # args[1] <- "~/git/predicting-capabilities/ObsScaling/" # nolint: commented_code_linter, line_length_linter.
 main <- function() { # nolint: function_name_linter
+  options(repos = c(CRAN = "https://cloud.r-project.org"))
   args <- commandArgs(trailingOnly = TRUE)
   #### Libraries ####
-  ## List of required packages in alphabetical order
-  packages <- c(
-    "caret", "dplyr", "ggplot2", "gtools",
-    "lme4", "pROC", "missMDA"
-  )
-  ## Function to install missing packages and load them
+  ## Install missing packages, and devtools if you haven't already
   install_and_load <- function(pkg) {
     if (!require(pkg, character.only = TRUE)) {
-      install.packages(pkg, dependencies = TRUE)
-      library(pkg, character.only = TRUE)
+      ## Set a CRAN mirror if not already set
+      if (length(getOption("repos")) == 0 || getOption("repos")["CRAN"] == "@CRAN@") {
+        options(repos = c(CRAN = "https://cloud.r-project.org"))
+      }
+
+      ## Try to install the package
+      tryCatch(
+        {
+          install.packages(pkg, dependencies = TRUE)
+        },
+        error = function(e) {
+          message(paste("Failed to install package:", pkg))
+          message("Error message:", e$message)
+          return(FALSE)
+        }
+      )
+
+      ## Try to load the package
+      if (!require(pkg, character.only = TRUE)) {
+        message(paste("Package", pkg, "is not available and could not be installed."))
+        return(FALSE)
+      }
     }
+    return(TRUE)
   }
-  ## Apply the function to the list of packages
-  lapply(packages, install_and_load)
+
+
+  ## List of required packages
+  packages <- c("caret", "dplyr", "ggplot2", "gtools", "lme4", "pROC", "missMDA", "glmmTMB")
+
+
+  ## Try to install and load each package
+  installed_packages <- sapply(packages, install_and_load)
+  if (!requireNamespace("devtools", quietly = TRUE)) {
+    install.packages("devtools")
+  }
+  library(devtools)
+  tryCatch(
+    {
+      install_version("TMB", version = "1.9.11", repos = "https://cloud.r-project.org")
+      detach("package:glmmTMB", unload = TRUE)
+      remove.packages("glmmTMB")
+      install.packages("glmmTMB")
+    },
+    error = function(e) {
+      message("Error installing packages: ", e$message)
+    }
+  )
+
+  ## Check if all packages were successfully installed and loaded
+  if (!all(installed_packages)) {
+    message("Not all required packages could be installed. Please check the error messages above.")
+    message("Proceeding with available packages...")
+  }
   ## Load packages
   library(caret)
   library(dplyr)
@@ -30,7 +74,7 @@ main <- function() { # nolint: function_name_linter
   setwd(args[1])
   base_llm_benchmark_eval <- read.csv(file.path(
     getwd(),
-    "/eval_results/base_llm_benchmark_eval.csv"
+    "/eval_results/base_llm_benchmark_pca_imputed.csv"
   ))
   base_llm_emergent_eval <- read.csv(file.path(
     getwd(),
@@ -59,6 +103,8 @@ main <- function() { # nolint: function_name_linter
   base_llm_emergent_eval$Model <- toupper(
     base_llm_emergent_eval$Model
   )
+
+  emergent_benchmarks <- names(base_llm_emergent_eval)[!names(base_llm_emergent_eval) %in% c("Model", "Repo")]
 
   ## Consolidate LLAMA and QWEN model families ####
   consolidate_model_family <- function(family) {
@@ -90,12 +136,22 @@ main <- function() { # nolint: function_name_linter
 
   ## Count the number of models in each family ####
   family_counts <- table(base_llm$Model.Family)
+  print("Model families:")
+  print(family_counts)
   ## Identify families with at least 2 models
-  valid_families <- names(family_counts[family_counts >= 2])
+  valid_families <- names(family_counts[family_counts > 2])
+  print("Model families with more than 2 models:")
+  print(valid_families)
   ## Filter the dataset to keep only the valid families
   base_llm <- base_llm[base_llm$Model.Family %in% valid_families, ]
   ## Re-factor Model.Family to remove unused levels
   base_llm$Model.Family <- factor(base_llm$Model.Family)
+  # Divide ipa_transliterate_2_bleu by 100
+  if ("ipa_transliterate_2_bleu" %in% names(base_llm)) {
+    base_llm$ipa_transliterate_2_bleu <- base_llm$ipa_transliterate_2_bleu / 100
+  }
+  # Remove ipa_transliterate_2_bleu column if it exists TODO fix this by running this benchmark
+  base_llm$ipa_transliterate_2_bleu <- NULL
   ## Summary stats
   print(summary(base_llm))
   ## Print the number of models remaining
@@ -104,6 +160,8 @@ main <- function() { # nolint: function_name_linter
   remaining_family_counts <- table(base_llm$Model.Family)
   print("Remaining model families and their counts:")
   print(remaining_family_counts)
+
+
   ## If you want to make a plot like I shared to group + emergent benchmarks
   # install.packages("PerformanceAnalytics") # nolint: commented_code_linter.
   # library(PerformanceAnalytics) # nolint: commented_code_linter.
@@ -179,11 +237,6 @@ main <- function() { # nolint: function_name_linter
         get_minus_1_normalized(idx, base_llm, benchmark)
       }
     )
-    ## Dynamically create successes and failures columns as well for response
-    base_llm[[paste(benchmark, "successes", sep = "_")]] <-
-      round(base_llm[[benchmark]] * number_of_trials)
-    base_llm[[paste(benchmark, "failures", sep = "_")]] <-
-      number_of_trials - base_llm[[paste(benchmark, "successes", sep = "_")]]
   }
   # base_llm : 107 rows, 71 cols 06/19 || 06/26 base_llm 101, 71
 
@@ -197,90 +250,92 @@ main <- function() { # nolint: function_name_linter
         stop("Boundary should be a numeric vector of length 2")
       }
     }
-    
+
     # Separate response variables and non-response numeric variables
     response_train_df <- train_df %>% select(all_of(response_vars))
-    numeric_train_df <- train_df %>% select(-all_of(response_vars)) %>% select_if(is.numeric)
+    numeric_train_df <- train_df %>%
+      select(-all_of(response_vars)) %>%
+      select_if(is.numeric)
     non_numeric_train_df <- train_df %>% select(!where(is.numeric), -all_of(response_vars))
-    
+
     if (verbose) {
       cat("Original train_df dimensions:", dim(train_df), "\n")
       cat("Numeric train_df dimensions excluding response:", dim(numeric_train_df), "\n")
     }
-    
+
     standardize <- function(data) {
       scale(data, center = TRUE, scale = TRUE)
     }
-    
+
     inverse_standardize <- function(data, mean, sd) {
       data * sd + mean
     }
-    
+
     train_mean <- colMeans(numeric_train_df, na.rm = TRUE)
     train_sd <- apply(numeric_train_df, 2, sd, na.rm = TRUE)
     train_scaled <- standardize(numeric_train_df)
-    
+
     if (verbose) {
       na_ratio <- sum(is.na(train_scaled)) / prod(dim(train_scaled))
       cat(sprintf("Missing values in training data: %.2f%%\n", na_ratio * 100))
     }
-    
+
     train_imputed <- imputePCA(train_scaled, ncp = n_components, method = "Regularized", maxiter = max_iter, threshold = tol)$completeObs
     train_final <- inverse_standardize(train_imputed, train_mean, train_sd)
-    
+
     if (!is.null(boundary)) {
       train_final <- pmax(pmin(train_final, boundary[2]), boundary[1])
     }
-    
+
     train_final_df <- as.data.frame(train_final)
     names(train_final_df) <- names(numeric_train_df)
     rownames(train_final_df) <- rownames(numeric_train_df)
-    
+
     train_final_df <- bind_cols(non_numeric_train_df, train_final_df, response_train_df)
-    
+
     if (!is.null(test_df)) {
       response_test_df <- test_df %>% select(all_of(response_vars))
-      numeric_test_df <- test_df %>% select(-all_of(response_vars)) %>% select_if(is.numeric)
+      numeric_test_df <- test_df %>%
+        select(-all_of(response_vars)) %>%
+        select_if(is.numeric)
       non_numeric_test_df <- test_df %>% select(!where(is.numeric), -all_of(response_vars))
-      
+
       if (verbose) {
         cat("Original test_df dimensions:", dim(test_df), "\n")
         cat("Numeric test_df dimensions excluding response:", dim(numeric_test_df), "\n")
       }
-      
+
       test_scaled <- scale(numeric_test_df, center = train_mean, scale = train_sd)
-      
+
       if (verbose) {
         na_ratio_test <- sum(is.na(test_scaled)) / prod(dim(test_scaled))
         cat(sprintf("Missing values in test data: %.2f%%\n", na_ratio_test * 100))
       }
-      
+
       test_imputed <- imputePCA(test_scaled, ncp = n_components, method = "Regularized", maxiter = max_iter, threshold = tol)$completeObs
       test_final <- inverse_standardize(test_imputed, train_mean, train_sd)
-      
+
       if (!is.null(boundary)) {
         test_final <- pmax(pmin(test_final, boundary[2]), boundary[1])
       }
-      
+
       test_final_df <- as.data.frame(test_final)
       names(test_final_df) <- names(numeric_test_df)
       rownames(test_final_df) <- rownames(numeric_test_df)
-      
+
       test_final_df <- bind_cols(non_numeric_test_df, test_final_df, response_test_df)
     } else {
       test_final_df <- NULL
     }
-    
+
     return(list(train_data = train_final_df, test_data = test_final_df))
   }
   ## Function to fit the fixed-effects model with error handling
+
   fit_model_fixed <- function(formula, data) {
     model <- tryCatch(
       {
-        glm(formula,
-          data = data,
-          family = binomial(link = "logit")
-        )
+        glm(formula, data = data, family = quasibinomial(link = "logit"))
       },
       warning = function(w) {
         message("Warning in model fitting: ", w$message)
@@ -297,22 +352,25 @@ main <- function() { # nolint: function_name_linter
     return(model)
   }
   ## Function to fit the mixed-effects model with error handling
+
+  library(glmmTMB)
   fit_model <- function(formula, data) {
     model <- tryCatch(
       {
-        glmer(formula,
+        print(formula)
+        glmmTMB(formula,
           data = data,
-          family = binomial(link = "logit"),
-          control = glmerControl(optimizer = "bobyqa")
+          family = beta_family(link = "logit"),
+          control = glmmTMBControl(optimizer = nlminb)
         )
       },
       warning = function(w) {
         message("Warning in model fitting: ", w$message)
-        return(NA)
+        return(w)
       },
       error = function(e) {
         message("Error in model fitting: ", e$message)
-        return(NA)
+        return(e)
       },
       finally = {
         message("Attempted model: ", deparse(formula))
@@ -320,34 +378,37 @@ main <- function() { # nolint: function_name_linter
     )
     return(model)
   }
+
   ## Function to get model metrics with error handling
   calculate_model_metrics <- function(model, test_data, response_formula) {
     if (is.null(model) || inherits(model, "try-error") || all(is.na(model))) {
+      message("Model is null, an error, or all NA")
       return(rep(NA, 3))
     }
     tryCatch(
       {
         if (inherits(model, "glm")) {
+          aic_value <- NA # AIC is not available for quasi-models
+          test_predictions <- predict(model, newdata = test_data, type = "response")
+        } else if (inherits(model, "glmmTMB")) {
           aic_value <- AIC(model)
-          test_predictions <- predict(model,
-            newdata = test_data, type = "response"
-          )
-        } else if (inherits(model, "glmerMod")) {
-          aic_value <- AIC(model)
-          test_predictions <- predict(model,
-            newdata = test_data, re.form = NA, type = "response"
-          )
+          test_predictions <- predict(model, newdata = test_data, type = "response")
         } else {
-          warning("Unexpected model class")
+          warng("Unexpected model class: ", class(model))
           return(c(NA, NA, NA))
         }
-        actual_values <- test_data[[response_formula]] / 100
-        accuracy <- mean(round(actual_values, 1) == round(test_predictions, 1))
+        actual_values <- test_data[[response_formula]]
         rmse <- sqrt(mean((actual_values - test_predictions)^2))
-        return(c(aic_value, accuracy, rmse))
+        print(paste("RMSE:", rmse))
+        r_squared <- cor(actual_values, test_predictions)^2
+        print(paste("R-squared:", r_squared))
+        return(c(aic_value, r_squared, rmse))
       },
       error = function(e) {
         warning("Error in calculate_model_metrics: ", e$message)
+        # print("Error occurred with model of class:", paste(class(model), collapse = ", "))
+        # print("Response formula:", response_formula)
+        # print("Test data columns:", names(test_data))
         return(rep(NA, 3))
       }
     )
@@ -367,24 +428,26 @@ main <- function() { # nolint: function_name_linter
 
   ## Get all combinations of benchmarks for formulas
   benchmark_minus_1_columns <- paste0(benchmark_columns, "_minus_1")
-  all_combinations <- do.call(c, lapply(1:3, function(k) {
+  all_combinations <- do.call(c, lapply(1:1, function(k) {
     combn(benchmark_minus_1_columns, k, simplify = FALSE)
   })) # use 1:16 for all combinations except empty set
 
-  for (benchmark in benchmark_columns) {
+  emergent_benchmark_columns <- benchmark_columns[benchmark_columns %in% emergent_benchmarks]
+
+  for (benchmark in emergent_benchmark_columns[length(emergent_benchmark_columns):1]) {
     ## Dynamic responses (Y) based on current benchmark
-    response_formula <- paste(benchmark, "successes", sep = "_")
-    response_failures <- paste(benchmark, "failures", sep = "_")
-    response <- paste("cbind(", response_formula, ",", response_failures, ")",
-      sep = ""
-    )
+    response_formula <- benchmark
+    response <- benchmark
+    # response_formula <- paste(benchmark, "successes", sep = "_")
+    # response_failures <- paste(benchmark, "failures", sep = "_")
+
     benchmark_minus_1 <- paste0(benchmark, "_minus_1")
 
     ## Remove NAs # TODO:dynamic depending on formula
-    # base_llm_clean <- base_llm[complete.cases(base_llm[c(
-    #   response_formula, response_failures,
-    #   "FLOPs..1E21.", "Model.Family", benchmark_minus_1
-    # )]), ]
+    base_llm_clean <- base_llm[complete.cases(base_llm[c(
+      response_formula,
+      "FLOPs..1E21.", "Model.Family", benchmark_minus_1
+    )]), ]
 
     ## Split data into training and testing sets # dynamic as well?
     train_df <- base_llm %>% filter(FLOPs..1E21. <= cutoff_flops) # nolint: object_usage_linter
@@ -397,7 +460,7 @@ main <- function() { # nolint: function_name_linter
     ## Change sets to imputed sets, add family back
     train_data <- result$train_data
     test_data <- result$test_data
-    
+
     ## Model 0: Base model with FLOPs only (fixed-effects)
     formula_base <- as.formula(paste(response, "~ 1 + log(FLOPs..1E21. + 0.001)"))
     model_base <- fit_model_fixed(formula_base, train_data)
@@ -412,6 +475,8 @@ main <- function() { # nolint: function_name_linter
       response,
       "~ log(FLOPs..1E21. + 0.001) + (1|Model.Family)"
     ))
+    print(response)
+    print(benchmark)
     model_base <- fit_model(formula_base, train_data)
     base_metrics <- calculate_model_metrics(model_base, test_data, response_formula) # nolint: object_usage_linter
     performance_metrics[nrow(performance_metrics) + 1, ] <- c(
@@ -452,7 +517,12 @@ main <- function() { # nolint: function_name_linter
     ## TODO: generalize the above?
 
     ## Grid search #### 06/26, FLOPs, family intercepts,
-    formula_components <- "log(FLOPs..1E21. + 0.001) + (1|Model.Family)"
+    formula_components <- "log(FLOPs..1E21.) + (1|Model.Family)"
+    # formulas <- lapply(seq_along(all_combinations), function(comb) {
+    #  components <- paste(all_combinations[comb], collapse = " + ")
+    #  formula_str <- paste(response, "~", formula_components, "+", components)
+    #  as.formula(formula_str)
+    # })
     formulas <- lapply(all_combinations, function(comb) {
       components <- paste(comb, collapse = " + ")
       formula_str <- paste(response, "~", formula_components, "+", components)
@@ -465,14 +535,39 @@ main <- function() { # nolint: function_name_linter
         test_data, response_formula
       )
       if (!is.na(dynamic_metrics[1])) {
+        print("Writing to performance metrics...")
+        print(gsub("\\s+", " ", paste(deparse(formula), collapse = "")))
         performance_metrics[nrow(performance_metrics) + 1, ] <- c(
           benchmark,
-          paste(formula[3]),
+          gsub("\\s+", " ", paste(deparse(formula), collapse = "")), #
           dynamic_metrics[1],
           dynamic_metrics[2],
           dynamic_metrics[3]
         )
       }
+    }
+
+    formula_components <- "1 + log(FLOPs..1E21.)"
+    formulas <- lapply(all_combinations, function(comb) {
+      components <- paste(comb, collapse = " + ")
+      formula_str <- paste(response, "~", formula_components, "+", components)
+      as.formula(formula_str)
+    })
+    for (formula in formulas) {
+      model_dynamic <- fit_model_fixed(formula, train_data)
+      dynamic_metrics <- calculate_model_metrics(
+        model_dynamic,
+        test_data, response_formula
+      )
+      print("Writing to performance metrics...")
+      print(gsub("\\s+", " ", paste(deparse(formula), collapse = "")))
+      performance_metrics[nrow(performance_metrics) + 1, ] <- c(
+        benchmark,
+        gsub("\\s+", " ", paste(deparse(formula), collapse = "")), #
+        dynamic_metrics[1],
+        dynamic_metrics[2],
+        dynamic_metrics[3]
+      )
     }
 
     ## Determine the best model for this benchmark
@@ -488,6 +583,8 @@ main <- function() { # nolint: function_name_linter
     #   best_models[[benchmark]] <- NA # nolint: commented_code_linter
     #   message("All models failed for benchmark: ", benchmark) # nolint: commented_code_linter
     # }
+    print("writing...")
+    write.csv2(performance_metrics, file.path(getwd(), "performance_metrics.csv"))
   }
 
   # print(best_models) # nolint: commented_code_linter
@@ -541,14 +638,14 @@ main <- function() { # nolint: function_name_linter
     )
 
   print(avg_performance_metrics)
-  
+
   # Function to extract unique predictors from formulas
   extract_predictors <- function(formula) {
     predictors <- unlist(strsplit(formula, "\\s*\\+\\s*"))
     predictors <- predictors[!grepl("log\\(FLOPs|\\(1 \\| Model\\.Family\\)", predictors)]
     return(predictors)
   }
-  
+
   # Apply the function and create a data frame of predictors and corresponding RMSEs
   extracted_predictors <- do.call(rbind, lapply(1:nrow(performance_metrics), function(i) {
     data.frame(
@@ -556,16 +653,14 @@ main <- function() { # nolint: function_name_linter
       avg_rmse = performance_metrics$avg_rmse[i]
     )
   }))
-  
+
   # Calculate the average RMSE for each unique predictor
   avg_rmse_per_predictor <- extracted_predictors %>%
     group_by(predictor) %>%
     summarise(avg_rmse = mean(avg_rmse, na.rm = TRUE)) %>%
     arrange(avg_rmse)
-  
+
   print(avg_rmse_per_predictor)
-  
-  
 }
 
 main()
