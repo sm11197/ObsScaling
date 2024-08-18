@@ -2,133 +2,25 @@ import pandas as pd
 import argparse
 import re
 import numpy as np
-from sklearn.metrics import mean_squared_error, r2_score
-from scipy.optimize import curve_fit
+from sklearn.metrics import mean_squared_error
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 import matplotlib.pyplot as plt
 import seaborn as sns
+import pystan
+import arviz as az
 
-
-def sigmoid(x):
-    return 1 / (1 + np.exp(-x))
-
-
-def inverse_sigmoid(x):
-    return np.log(x / (1 - x))
-
-
-def transform_y(y):
-    # Clip values to avoid log(0) or log(1)
-    y_clipped = np.clip(y, 0.001, 0.999)
-    return inverse_sigmoid(y_clipped)
-
-
-def inverse_transform_y(y):
-    return sigmoid(y)
-
-
-def sigmoid_transformed_x(x, *p):
-    p = np.array(p)
-    return sigmoid(np.dot(x, p))
-
-
-def format_linear_func_form(weights, metric_names, bias=None, eps=5e-3):
-    terms = []
-    for weight, name in zip(weights, metric_names):
-        if np.abs(weight) <= eps:
-            continue
-        sign = "+" if weight > 0 else "-"
-        abs_weight = abs(weight)
-        if np.abs(abs_weight - 1.0) <= eps:
-            term = f"{sign} {name}"
-        else:
-            term = f"{sign} {abs_weight:.2f}{name}"
-        terms.append(term.strip())
-
-    if terms:
-        terms[0] = terms[0].lstrip("+").strip()
-        expression = " ".join(terms)
-    else:
-        expression = ""
-
-    if bias is not None and np.abs(bias) > eps:
-        if bias > 0:
-            expression += f" + {bias:.2f}"
-        elif bias < 0:
-            expression += f" - {-bias:.2f}"
-
-    return expression
-
-
-def fit_model(X, y, model_type):
-    X = sm.add_constant(X)
-
-    if model_type == "linear":
-        model = sm.OLS(y, X).fit()
-        fit_func = lambda x: model.predict(sm.add_constant(x))
-        weights = model.params.values[1:]
-        bias = model.params.values[0]
-        func_form = format_linear_func_form(weights, X.columns[1:], bias)
-    elif model_type == "sigmoid":
-        p0 = np.ones(X.shape[1]) * 1e-2
-        popt, _ = curve_fit(
-            sigmoid_transformed_x, X.values, y.values, p0=p0, maxfev=10000
-        )
-        fit_func = lambda x: sigmoid_transformed_x(sm.add_constant(x), *popt)
-        weights = popt[1:]
-        bias = popt[0]
-        linear_form = format_linear_func_form(weights, X.columns[1:], bias)
-        func_form = f"sigmoid({linear_form})"
-
-    return fit_func, func_form
-
-
-def calculate_r2(y_true, y_pred):
-    return r2_score(y_true, y_pred)
-
-
-def clean_column_name(name):
-    return re.sub(r"\W+", "_", name).strip("_")
-
-
-def summarize_weights(model):
-    if isinstance(model, sm.regression.linear_model.RegressionResultsWrapper):
-        return pd.DataFrame(
-            {"coef": model.params, "std_err": model.bse, "p_value": model.pvalues}
-        )
-    elif isinstance(model, sm.regression.mixed_linear_model.MixedLMResultsWrapper):
-        fixed_effects = pd.DataFrame(
-            {
-                "coef": model.fe_params,
-                "std_err": model.bse_fe,
-                # "p_value": model.pvalues_fe,
-            }
-        )
-        random_effects = []
-        for group, effects in model.random_effects.items():
-            re_df = pd.DataFrame(effects, columns=["coef"])
-            re_df["group"] = group
-            re_df["variable"] = re_df.index
-            random_effects.append(re_df)
-
-        random_effects_df = pd.concat(random_effects, ignore_index=True)
-        random_effects_df["std_err"] = np.nan
-        random_effects_df["p_value"] = np.nan
-
-        return pd.concat(
-            [
-                fixed_effects.reset_index().rename(columns={"index": "variable"}),
-                random_effects_df,
-            ],
-            keys=["Fixed Effects", "Random Effects"],
-        )
-    else:
-        return pd.DataFrame()
+from src.utils import (
+    transform_y,
+    inverse_transform_y,
+    clean_column_name,
+    summarize_weights,
+    fit_model,
+    calculate_r2,
+)
 
 
 def compare_models(train_df, test_df, benchmark):
-
     train_df.columns = [clean_column_name(col) for col in train_df.columns]
     test_df.columns = [clean_column_name(col) for col in test_df.columns]
     # transform flops into log scale
@@ -157,10 +49,16 @@ def compare_models(train_df, test_df, benchmark):
     # Linear Mixed-Effects Model
     y_transformed = transform_y(y_train)
     train_df["y_transformed"] = y_transformed
+    print(y_transformed)
+    # train_df['FLOPs_scaled'] = (train_df['FLOPs_1E21'] - train_df['FLOPs_1E21'].mean()) / train_df['FLOPs_1E21'].std()
+    # test_df['FLOPs_scaled'] = (test_df['FLOPs_1E21'] - train_df['FLOPs_1E21'].mean()) / train_df['FLOPs_1E21'].std()
     mixed_model = smf.mixedlm(
-        f"y_transformed ~ FLOPs_1E21", data=train_df, groups=train_df["Model_Family"]
+        f"y_transformed ~ FLOPs_1E21",
+        data=train_df,
+        groups=train_df["Model_Family"],
+        re_formula="~FLOPs_1E21",
     )
-    mixed_model_fit = mixed_model.fit()
+    mixed_model_fit = mixed_model.fit(method=["lbfgs"])
     y_pred_mixed_train = inverse_transform_y(mixed_model_fit.predict(train_df))
     y_pred_mixed_test = inverse_transform_y(mixed_model_fit.predict(test_df))
     rmse_mixed = np.sqrt(mean_squared_error(y_test, y_pred_mixed_test))
@@ -170,6 +68,74 @@ def compare_models(train_df, test_df, benchmark):
         "train": (y_train, y_pred_mixed_train),
         "test": (y_test, y_pred_mixed_test),
     }
+    results, predictions = stan_models(
+        train_df, test_df, benchmark, results, predictions
+    )
+    results, predictions = benchmark_models(
+        train_df, test_df, benchmark, results, predictions
+    )
+    return results, predictions
+
+
+def stan_models(train_df, test_df, benchmark, results, predictions):
+    
+    # Prepare data
+    stan_data = {
+        'N': len(train_df),
+        'J': train_df['Model_Family'].nunique(),
+        'y': train_df['y_transformed'].values,
+        'x': train_df['FLOPs_1E21'].values,
+        'group': train_df['Model_Family'].astype('category').cat.codes.values + 1
+    }
+    
+    # Compile the model
+    with open("linear_mixed_effects.stan", "r") as f:
+        stan_model_code = f.read()
+    sm = pystan.StanModel(model_code=stan_model_code)  # stan_model_code is the code from the artifact
+    
+    # Fit the model
+    fit = sm.sampling(data=stan_data, iter=2000, chains=4)
+    
+    # Extract and analyze results
+    az_trace = az.from_pystan(fit)
+    az.plot_trace(az_trace)
+    az.summary(az_trace, var_names=['beta0', 'beta1', 'sigma_e', 'sigma_u'])
+
+    # Extract posterior samples
+    posterior_samples = fit.extract()
+    
+    # Function to predict
+    def predict(x, group, samples):
+        return samples['beta0'][:, np.newaxis] + samples['beta1'][:, np.newaxis] * x + samples['u'][:, group]
+    
+    # Predict for test data
+    test_data = {
+        'x': test_df['FLOPs_1E21'].values,
+        'group': test_df['Model_Family'].astype('category').cat.codes.values
+    }
+    
+    y_pred_samples = predict(test_data['x'], test_data['group'], posterior_samples)
+    
+    # Calculate mean prediction and credible intervals
+    y_pred_mean = np.mean(y_pred_samples, axis=0)
+    y_pred_lower, y_pred_upper = np.percentile(y_pred_samples, [2.5, 97.5], axis=0)
+    
+    # Inverse transform predictions
+    y_pred_mean = inverse_transform_y(y_pred_mean)
+    y_pred_lower = inverse_transform_y(y_pred_lower)
+    y_pred_upper = inverse_transform_y(y_pred_upper)
+    
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred_mean))
+    r2 = calculate_r2(y_test, y_pred_mean)
+    results["Stan mixed effects"] = {"rmse": rmse, "r2": r2}
+    predictions["Stan mixed effects"] = {
+        "train": (y_train, y_pred_train),
+        "test": (y_test, y_pred_mean),
+    }
+
+    
+    
+def benchmark_models(train_df, test_df, benchmark, results, predictions):
 
     # GLM on all benchmark scores
     train_df[[f"{benchmark}_minus_1_scaling_factor"]] = np.log(
@@ -415,9 +381,9 @@ def get_minus_1_normalized(model, data, benchmark_column, flops_cutoff=None):
             target_model = smaller_models.head(1)
     else:
         target_model = pd.DataFrame(
-                {"FLOPs (1E21)": [current_flops], benchmark_column: [current_score]}
-            )
-    
+            {"FLOPs (1E21)": [current_flops], benchmark_column: [current_score]}
+        )
+
     minus_1_flops = target_model["FLOPs (1E21)"].values[0]
     minus_1_score = target_model[benchmark_column].values[0]
     scaling_factor = current_flops / minus_1_flops
@@ -446,7 +412,8 @@ def augment_dataset(train_df, benchmark_columns, flops_cutoff):
         ]
         # remove row with the largest flops
         closest_within_family = closest_within_family[
-            closest_within_family["FLOPs (1E21)"] != closest_within_family["FLOPs (1E21)"].max()
+            closest_within_family["FLOPs (1E21)"]
+            != closest_within_family["FLOPs (1E21)"].max()
         ]
         for _, target_model in closest_within_family.iterrows():
             for benchmark in benchmark_columns:
