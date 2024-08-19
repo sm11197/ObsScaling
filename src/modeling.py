@@ -6,9 +6,6 @@ from sklearn.metrics import mean_squared_error
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 import matplotlib.pyplot as plt
-import seaborn as sns
-import arviz as az
-import pymc as pm
 
 from src.utils import (
     transform_y,
@@ -18,6 +15,7 @@ from src.utils import (
     fit_model,
     calculate_r2,
 )
+from src.bayesian_models import pymc_models, benchmark_models_pymc
 
 
 def compare_models(train_df, test_df, benchmark):
@@ -26,6 +24,12 @@ def compare_models(train_df, test_df, benchmark):
     # transform flops into log scale
     train_df[["FLOPs_1E21"]] = np.log(train_df[["FLOPs_1E21"]])
     test_df[["FLOPs_1E21"]] = np.log(test_df[["FLOPs_1E21"]])
+    train_df[[f"{benchmark}_minus_1_scaling_factor"]] = np.log(
+        train_df[[f"{benchmark}_minus_1_scaling_factor"]]
+    )
+    test_df[[f"{benchmark}_minus_1_scaling_factor"]] = np.log(
+        test_df[[f"{benchmark}_minus_1_scaling_factor"]]
+    )
     X_train = train_df[["FLOPs_1E21"]]
     y_train = train_df[benchmark]
     X_test = test_df[["FLOPs_1E21"]]
@@ -68,6 +72,9 @@ def compare_models(train_df, test_df, benchmark):
         "train": (y_train, y_pred_mixed_train),
         "test": (y_test, y_pred_mixed_test),
     }
+    results, predictions = benchmark_models_pymc(
+        train_df, test_df, benchmark, results, predictions
+    )
     results, predictions = pymc_models(
         train_df, test_df, benchmark, results, predictions
     )
@@ -77,381 +84,12 @@ def compare_models(train_df, test_df, benchmark):
     return results, predictions
 
 
-def create_and_fit_beta_model(train_df, test_df, benchmark):
-    # Prepare data
-    y = train_df[benchmark].values  # Assuming this is already accuracy data
-    X = train_df["FLOPs_1E21"].values
-
-    # Create a mapping for group codes
-    unique_groups = train_df["Model_Family"].unique()
-    group_mapping = {group: i for i, group in enumerate(unique_groups)}
-
-    # Map the group codes
-    groups = np.array([group_mapping[group] for group in train_df["Model_Family"]])
-    n_groups = len(unique_groups)
-
-    print(f"Number of unique groups: {n_groups}")
-    print(f"Group codes range: {groups.min()} to {groups.max()}")
-    print(f"Shape of y: {y.shape}")
-    print(f"Shape of X: {X.shape}")
-
-    # Create model
-    with pm.Model() as model:
-        # Priors
-        beta0 = pm.Normal("beta0", mu=0, sigma=5)
-        beta1 = pm.Normal("beta1", mu=0, sigma=5)
-        sigma_u = pm.HalfCauchy("sigma_u", beta=5)
-        sigma_beta_u = pm.HalfCauchy("sigma_beta_u", beta=5)
-
-        # Random effects
-        u = pm.Normal("u", mu=0, sigma=sigma_u, shape=n_groups)
-        beta_u = pm.Normal("beta_u", mu=0, sigma=sigma_beta_u, shape=n_groups)
-
-        # Expected value of outcome
-        mu = pm.math.invlogit(beta0 + beta1 * X + u[groups] + beta_u[groups] * X)
-
-        # Precision parameter
-        phi = pm.Gamma("phi", alpha=1, beta=0.1)
-        alpha = mu * phi
-        beta = (1 - mu) * phi
-
-        # Likelihood (Beta distribution)
-        # Add a small epsilon to avoid exact 0 or 1 values
-        eps = 1e-6
-        y_adj = y * (1 - 2 * eps) + eps
-        # y_obs = pm.Beta('y_obs', alpha=mu*phi, beta=(1-mu)*phi, observed=y_adj)
-        y_obs = pm.Beta("y_obs", alpha=alpha, beta=beta, observed=y_adj)
-
-        # Fit model
-        trace = pm.sample(4000, tune=4000, return_inferencedata=True)
-
-    # Predict for train data
-    with model:
-        mu_train = pm.math.invlogit(beta0 + beta1 * X + u[groups] + beta_u[groups] * X)
-        alpha_train = mu_train * phi
-        beta_train = (1 - mu_train) * phi
-        # y_pred_train = pm.Beta('y_pred_train', alpha=mu_train*phi, beta=(1-mu_train)*phi)
-        y_pred_train = pm.Beta("y_pred_train", alpha=alpha_train, beta=beta_train)
-        posterior_pred_train = pm.sample_posterior_predictive(
-            trace, var_names=["y_pred_train"]
-        )
-
-    # Extract predictions
-    y_pred_train_samples = posterior_pred_train.posterior_predictive["y_pred_train"]
-    y_pred_train_mean = y_pred_train_samples.mean(dim=("chain", "draw")).values
-
-    # Predict for test data
-    with model:
-        X_new = test_df["FLOPs_1E21"].values
-        groups_new = np.array(
-            [group_mapping.get(group, -1) for group in test_df["Model_Family"]]
-        )
-
-        # Handle any new groups in test data
-        groups_new[groups_new == -1] = n_groups
-        if -1 in groups_new:
-            u = pm.Normal.dist(mu=0, sigma=sigma_u, shape=n_groups + 1)
-
-        print(f"Test group codes range: {groups_new.min()} to {groups_new.max()}")
-
-        mu_pred = pm.math.invlogit(
-            beta0 + beta1 * X_new + u[groups_new] + beta_u[groups_new] * X_new
-        )
-        alpha_pred = mu_pred * phi
-        beta_pred = (1 - mu_pred) * phi
-        # y_pred = pm.Beta('y_pred', alpha=mu_pred*phi, beta=(1-mu_pred)*phi)
-        y_pred = pm.Beta("y_pred", alpha=alpha_pred, beta=beta_pred)
-        posterior_pred = pm.sample_posterior_predictive(trace, var_names=["y_pred"])
-
-    y_pred_samples = posterior_pred.posterior_predictive["y_pred"]
-    y_pred_mean = y_pred_samples.mean(dim=("chain", "draw")).values
-    y_pred_hdi = az.hdi(y_pred_samples)
-
-    return trace, y_pred_mean, y_pred_train_mean
-
-
-def create_and_fit_linear_mixed_effects_model(train_df, test_df):
-    # Prepare data
-    y = train_df["y_transformed"].values
-    X = train_df["FLOPs_1E21"].values
-    unique_groups = train_df["Model_Family"].unique()
-    group_mapping = {group: i for i, group in enumerate(unique_groups)}
-
-    # Map the group codes
-    groups = np.array([group_mapping[group] for group in train_df["Model_Family"]])
-    n_groups = len(unique_groups)
-
-    print(f"Number of unique groups: {n_groups}")
-    print(f"Group codes range: {groups.min()} to {groups.max()}")
-    print(f"Shape of y: {y.shape}")
-    print(f"Shape of X: {X.shape}")
-
-    # Create model
-    with pm.Model() as model:
-        # Priors
-        beta0 = pm.Normal("beta0", mu=0, sigma=5)
-        beta1 = pm.Normal("beta1", mu=0, sigma=5)
-        sigma_e = pm.HalfCauchy("sigma_e", beta=5)
-        sigma_u = pm.HalfCauchy("sigma_u", beta=5)
-        sigma_beta_u = pm.HalfCauchy("sigma_beta_u", beta=5)
-
-        # Random effects
-        u = pm.Normal("u", mu=0, sigma=sigma_u, shape=n_groups)
-        beta_u = pm.Normal("beta_u", mu=0, sigma=sigma_beta_u, shape=n_groups)
-
-        # Expected value of outcome
-        mu = beta0 + beta1 * X + u[groups] + beta_u[groups] * X
-
-        # Likelihood (sampling distribution) of observations
-        y_obs = pm.Normal("y_obs", mu=mu, sigma=sigma_e, observed=y)
-
-        # Fit model
-        trace = pm.sample(4000, tune=4000, return_inferencedata=True)
-
-    # Predict for train data
-    with model:
-        # mu_train = beta0 + beta1 * X + u[groups]
-        mu_train = beta0 + beta1 * X + u[groups] + beta_u[groups] * X
-        y_pred_train = pm.Normal("y_pred_train", mu=mu_train, sigma=sigma_e)
-        posterior_pred_train = pm.sample_posterior_predictive(
-            trace, var_names=["y_pred_train"]
-        )
-
-    y_pred_train_samples = posterior_pred_train.posterior_predictive["y_pred_train"]
-    y_pred_train_mean = y_pred_train_samples.mean(dim=("chain", "draw")).values
-    y_pred_train_hdi = az.hdi(y_pred_train_samples)
-
-    # Predict
-    with model:
-        X_new = test_df["FLOPs_1E21"].values
-        groups_new = np.array(
-            [group_mapping.get(group, -1) for group in test_df["Model_Family"]]
-        )
-
-        # Handle any new groups in test data
-        groups_new[groups_new == -1] = n_groups
-        if -1 in groups_new:
-            u = pm.Normal.dist(mu=0, sigma=sigma_u, shape=n_groups + 1)
-        # groups_new = pd.Categorical(test_df['Model_Family'], categories=train_df['Model_Family'].unique()).codes
-        mu_pred = beta0 + beta1 * X_new + u[groups_new] + beta_u[groups_new] * X_new
-        y_pred = pm.Normal("y_pred", mu=mu_pred, sigma=sigma_e)
-        posterior_pred = pm.sample_posterior_predictive(trace, var_names=["y_pred"])
-
-    # Extract predictions
-    y_pred_samples = posterior_pred.posterior_predictive["y_pred"]
-    y_pred_mean = y_pred_samples.mean(dim=("chain", "draw")).values
-    y_pred_hdi = az.hdi(y_pred_samples)
-
-    # Inverse transform predictions
-    y_pred_mean = inverse_transform_y(y_pred_mean)
-    y_pred_train_mean = inverse_transform_y(y_pred_train_mean)
-    # y_pred_lower = inverse_transform_y(y_pred_hdi.sel(hdi='lower').values)
-    # y_pred_upper = inverse_transform_y(y_pred_hdi.sel(hdi='higher').values)
-
-    return trace, y_pred_mean, y_pred_train_mean  # , y_pred_lower, y_pred_upper
-
-
-def pymc_models(train_df, test_df, benchmark, results, predictions):
-
-    y_train = train_df[benchmark]
-    y_test = test_df[benchmark]
-    # Use the model
-    # trace, y_pred_mean, y_pred_lower, y_pred_upper = create_and_fit_pymc_model(train_df, test_df)
-    trace, y_pred_mean, y_pred_train_mean = create_and_fit_linear_mixed_effects_model(
-        train_df, test_df
-    )
-    # Analyze results
-    az.plot_trace(trace)
-    az.summary(trace, var_names=["beta0", "beta1", "sigma_e", "sigma_u"])
-
-    # Calculate metrics
-    rmse_pymc = np.sqrt(mean_squared_error(y_test, y_pred_mean))
-    r2_pymc = calculate_r2(y_test, y_pred_mean)
-
-    results["PyMC Model"] = {"rmse": rmse_pymc, "r2": r2_pymc}
-    predictions["PyMC Model"] = {
-        "train": (y_train, y_pred_train_mean),
-        "test": (y_test, y_pred_mean),
-    }
-
-    trace, y_pred_mean, y_pred_train_mean = create_and_fit_beta_model(
-        train_df, test_df, benchmark
-    )
-    # Analyze results
-    az.plot_trace(trace)
-    # az.summary(trace, var_names=["beta0", "beta1", "sigma_e", "sigma_u"])
-
-    # Calculate metrics
-    rmse_pymc = np.sqrt(mean_squared_error(y_test, y_pred_mean))
-    r2_pymc = calculate_r2(y_test, y_pred_mean)
-
-    results["PyMC Beta Regression Model"] = {"rmse": rmse_pymc, "r2": r2_pymc}
-    predictions["PyMC Beta Regression Model"] = {
-        "train": (y_train, y_pred_train_mean),
-        "test": (y_test, y_pred_mean),
-    }
-    return results, predictions
-
-
-def prepare_data_for_pymc(df, benchmark_cols):
-    X = df[benchmark_cols].values
-    y = df["y_transformed"].values
-    return X, y
-
-
-def summarize_pymc_weights(trace, benchmark_cols):
-    summary = az.summary(trace, var_names=["beta"])
-    weights = pd.DataFrame(
-        {
-            "variable": benchmark_cols,
-            "mean": summary["mean"],
-            "sd": summary["sd"],
-            "hdi_3%": summary["hdi_3%"],
-            "hdi_97%": summary["hdi_97%"],
-        }
-    )
-    return weights
-
-
-def create_and_fit_glm(X, y):
-    with pm.Model() as model:
-        beta = pm.Normal("beta", mu=0, sigma=10, shape=X.shape[1])
-        sigma = pm.HalfCauchy("sigma", beta=5)
-
-        mu = pm.math.dot(X, beta)
-        y_obs = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y)
-
-        trace = pm.sample(2000, tune=1000, return_inferencedata=True)
-
-    return model, trace
-
-
-def create_and_fit_mixed_effects_glm(X, y, groups):
-    with pm.Model() as model:
-        # Fixed effects
-        beta = pm.Normal("beta", mu=0, sigma=10, shape=X.shape[1])
-
-        # Random effects
-        sigma_u = pm.HalfCauchy("sigma_u", beta=5)
-        u = pm.Normal("u", mu=0, sigma=sigma_u, shape=len(np.unique(groups)))
-
-        # Error term
-        sigma = pm.HalfCauchy("sigma", beta=5)
-
-        mu = pm.math.dot(X, beta) + u[groups]
-        y_obs = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y)
-
-        trace = pm.sample(2000, tune=1000, return_inferencedata=True)
-
-    return model, trace
-
-
-def benchmark_models_pymc(train_df, test_df, benchmark, results, predictions):
-    y_train = train_df[benchmark]
-    y_test = test_df[benchmark]
-
-    # Prepare data
-    train_df[[f"{benchmark}_minus_1_scaling_factor"]] = np.log(
-        train_df[[f"{benchmark}_minus_1_scaling_factor"]]
-    )
-    test_df[[f"{benchmark}_minus_1_scaling_factor"]] = np.log(
-        test_df[[f"{benchmark}_minus_1_scaling_factor"]]
-    )
-    benchmark_cols = [col for col in train_df.columns if col.endswith("_minus_1")]
-    benchmark_cols = [col for col in benchmark_cols if "PC" in col]
-    benchmark_cols.append(f"{benchmark}_minus_1_scaling_factor")
-    benchmark_cols.append(f"{benchmark}_minus_1")
-
-    X_train, y_train_transformed = prepare_data_for_pymc(train_df, benchmark_cols)
-    X_test, y_test_transformed = prepare_data_for_pymc(test_df, benchmark_cols)
-
-    # GLM on all benchmark scores
-    glm_model, glm_trace = create_and_fit_glm(X_train, y_train_transformed)
-
-    with glm_model:
-        y_pred_glm_train = pm.sample_posterior_predictive(
-            glm_trace, var_names=["y_obs"]
-        )
-        y_pred_glm_test = pm.sample_posterior_predictive(
-            glm_trace,
-            var_names=["y_obs"],
-            posterior_predictive_samples=1000,
-            prediction_samples=1000,
-            X=X_test,
-        )
-
-    y_pred_glm_train = inverse_transform_y(y_pred_glm_train["y_obs"].mean(axis=0))
-    y_pred_glm_test = inverse_transform_y(y_pred_glm_test["y_obs"].mean(axis=0))
-
-    rmse_glm = np.sqrt(mean_squared_error(y_test, y_pred_glm_test))
-    r2_glm = calculate_r2(y_test, y_pred_glm_test)
-
-    results["PyMC GLM on All Benchmarks"] = {"rmse": rmse_glm, "r2": r2_glm}
-    predictions["PyMC GLM on All Benchmarks"] = {
-        "train": (y_train, y_pred_glm_train),
-        "test": (y_test, y_pred_glm_test),
-    }
-
-    glm_weights = summarize_weights(glm_trace, benchmark_cols)
-    print("GLM Weights:", glm_weights)
-
-    # GLM with mixed effects for compute correction
-    groups = pd.Categorical(train_df["Model_Family"]).codes
-    mixed_model, mixed_trace = create_and_fit_mixed_effects_glm(
-        X_train, y_train_transformed, groups
-    )
-
-    with mixed_model:
-        y_pred_mixed_train = pm.sample_posterior_predictive(
-            mixed_trace, var_names=["y_obs"]
-        )
-
-        # For test set predictions, we need to handle potential new groups
-        test_groups = pd.Categorical(
-            test_df["Model_Family"], categories=train_df["Model_Family"].unique()
-        ).codes
-        test_groups[test_groups == -1] = len(
-            np.unique(groups)
-        )  # Assign new groups to a new level
-
-        y_pred_mixed_test = pm.sample_posterior_predictive(
-            mixed_trace,
-            var_names=["y_obs"],
-            posterior_predictive_samples=1000,
-            prediction_samples=1000,
-            X=X_test,
-            groups=test_groups,
-        )
-
-    y_pred_mixed_train = inverse_transform_y(y_pred_mixed_train["y_obs"].mean(axis=0))
-    y_pred_mixed_test = inverse_transform_y(y_pred_mixed_test["y_obs"].mean(axis=0))
-
-    rmse_mixed = np.sqrt(mean_squared_error(y_test, y_pred_mixed_test))
-    r2_mixed = calculate_r2(y_test, y_pred_mixed_test)
-
-    results["PyMC Mixed-Effects GLM"] = {"rmse": rmse_mixed, "r2": r2_mixed}
-    predictions["PyMC Mixed-Effects GLM"] = {
-        "train": (y_train, y_pred_mixed_train),
-        "test": (y_test, y_pred_mixed_test),
-    }
-
-    mixed_weights = summarize_weights(mixed_trace, benchmark_cols)
-    print("Mixed-Effects GLM Weights:", mixed_weights)
-
-    return results, predictions
-
-
 def benchmark_models(train_df, test_df, benchmark, results, predictions):
 
     y_train = train_df[benchmark]
     y_test = test_df[benchmark]
     # GLM on all benchmark scores
-    train_df[[f"{benchmark}_minus_1_scaling_factor"]] = np.log(
-        train_df[[f"{benchmark}_minus_1_scaling_factor"]]
-    )
-    test_df[[f"{benchmark}_minus_1_scaling_factor"]] = np.log(
-        test_df[[f"{benchmark}_minus_1_scaling_factor"]]
-    )
+    
     benchmark_cols = [col for col in train_df.columns if col.endswith("_minus_1")]
     benchmark_cols = [col for col in benchmark_cols if "PC" in col]
     benchmark_cols.append(f"{benchmark}_minus_1_scaling_factor")
